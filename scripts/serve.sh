@@ -111,6 +111,14 @@ PROM_MULTIPROC="${PROM_MULTIPROC:-0}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
 DOCKER_EXTRA="${DOCKER_EXTRA:-}"
+# A single bridged, port-mapped container cannot join a multi-node mp group
+# (cross-node NCCL and the rendezvous need the hosts' fabric IPs), and serve.sh
+# always loads with the PLE mmap hook that is untested under TP. The
+# EXPERIMENTAL two-Spark path is scripts/serve-tp2.sh (docs/MULTI-NODE-TP2.md).
+if [ "${TP_SIZE:-1}" != 1 ]; then
+  echo "!! TP_SIZE=$TP_SIZE is not what serve.sh launches — use scripts/serve-tp2.sh (see docs/MULTI-NODE-TP2.md)"
+  exit 1
+fi
 # Split flags without eval, shell execution or pathname expansion.
 DOCKER_ARGS=()
 read -r -a DOCKER_ARGS <<< "${DOCKER_EXTRA//$'\n'/ }"

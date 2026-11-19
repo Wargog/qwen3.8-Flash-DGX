@@ -81,6 +81,7 @@ load_profile() {
   export GPU_MEM="${GPU_MEM:-0.80}" KV_DTYPE="${KV_DTYPE:-auto}"
   export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.33}"
   export DRAFT_MODEL="${DRAFT_MODEL:-}" DRAFT_TOKENS="${DRAFT_TOKENS:-4}"
+  export TP_SIZE="${TP_SIZE:-1}"
 }
 
 # The image must match the current recipe. Retain old images locally for rollback.
@@ -259,6 +260,12 @@ cmd_doctor() {
   step "profile sanity"
   if [ "${YARN:-0}" = 0 ] && [ "${CTX:-262144}" -gt 262144 ]; then fail "CTX=$CTX above the native 262144 needs YARN=1"; fi
   if [ "$KV_DTYPE" = auto ] && [ "${CTX:-262144}" -gt 500000 ]; then warn "CTX=$CTX in bf16 KV: 500k is the validated ceiling (800k got OOM-killed on a long prefill); 1M needs KV_DTYPE=fp8_e4m3"; fi
+  if [ "${TP_SIZE:-1}" != 1 ]; then
+    warn "TP_SIZE=$TP_SIZE: the tensor-parallel lane is EXPERIMENTAL and was primarily written by an AI agent — see docs/MULTI-NODE-TP2.md"
+    if [ "$MODE" = hybrid ] || [ "$MODE" = hybrid-mtp ]; then fail "MODE=$MODE does not load at TP>1 (shared_expert 320/rank vs fp8 block 128, issue #52) — use MODE=nvfp4 or the §7.1 carveout"; fi
+    if [ "${DRAFT_VOCAB:-1}" != 0 ]; then fail "DRAFT_VOCAB crashes at TP>1 (global ids vs the row-sharded lm_head, issue #52) — set DRAFT_VOCAB=0"; fi
+    if [ "${YARN:-0}" != 0 ]; then warn "YaRN beyond native CTX is unverified on TP (#52, x00byte, capetron all ran native 262k)"; fi
+  fi
   [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ] && ok "profile looks fine"
 
   echo

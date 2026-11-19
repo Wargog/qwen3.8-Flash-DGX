@@ -48,6 +48,7 @@ shared network, use an authenticated gateway or set vLLM's `--api-key`. See
 | Shorter interruptions to active streams during long prefills | `shared` |
 | Previous MTP2 recipe, with reduced draft vocabulary | `mtp-standard` |
 | Opt-in prefix-cache checkpoint workaround at native 262k context | `prefix-cache-safe` |
+| Two DGX Sparks, TP=2 over RoCE — experimental, primarily AI-written, unvalidated on a live pair | `tp2` (launch with `scripts/serve-tp2.sh`, not `./flash serve`; see [Multi-node guide](docs/MULTI-NODE-TP2.md)) |
 
 ```bash
 ./flash profiles
@@ -128,6 +129,7 @@ With `published`, lower `CTX` if the engine reports a smaller KV ceiling.
 
 | Date | Change |
 | --- | --- |
+| 2026-11-19 | **Experimental two-Spark TP=2 lane** (`tp2` profile + `scripts/serve-tp2.sh`), primarily AI-written and not yet validated on a live pair. [Multi-node guide](docs/MULTI-NODE-TP2.md). |
 | 2026-11-15 | **Opt-in prefix-cache checkpoint workaround for vLLM 0.33.** [Configuration, cache-hit checks and validation limits](docs/PREFIX-CACHE-WORKAROUND.md). |
 | 2026-11-04 | **vLLM 0.33 and `mtp-fast` by default.** [Upgrade and measurements](#vllm-v033-upgrade). |
 | 2026-11-04 | **1M-context profiles.** `dflash-1m` and `mtp4-1m` passed retrieval at 990k. [Results and profile choice](#choosing-a-1m-context-profile). |
