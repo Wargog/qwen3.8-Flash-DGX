@@ -72,16 +72,21 @@ stage-sliceable in this vLLM). Two Sparks TP=2 is therefore the natural pairing.
 
 ### 3.1 Fabric (both nodes)
 
-Follow NVIDIA's [Connect Multiple DGX Sparks](https://build.nvidia.com/spark/connect-multiple-sparks)
-playbook. The minimum that matters here:
+If the pair was configured with the NVIDIA Sync [Cluster Assistant](https://docs.nvidia.com/sync/latest/cluster-assistant.html),
+the ConnectX-7 interfaces already carry **preset 10.100.x.x addresses** and there is
+nothing to configure — just read them (`ip -br addr`) and copy yours into the profile's
+fabric block (`MASTER_ADDR`, `PEER`, `ROCE_SUBNET`). Do not add a second subnet on top;
+one consistent address per link is what NCCL resolves the RoCEv2 GID against.
+
+Otherwise follow NVIDIA's [Connect Multiple DGX Sparks](https://build.nvidia.com/spark/connect-multiple-sparks)
+playbook. The minimum that matters here (`<peer-fabric-ip>` = the other node's address
+on the same link):
 
 ```shell
-# link up at 200G, MTU 9000, one IPv4 subnet shared by the two nodes on the CX-7 iface
 ip link set dev enp1s0f0np0 mtu 9000            # your iface name: `ls /sys/class/infiniband` + `ip a`
-ip addr add 192.168.200.1/24 dev enp1s0f0np0    # .2 on the worker — or just keep the addresses
-                                               # the boxes came with (often 10.x); ROCE_SUBNET only
-                                               # has to name whichever subnet both RoCE ifaces share
-ping -c3 -M do -s 8000 192.168.200.2             # ~<1 ms, no fragmentation
+ip addr add 10.100.0.1/24 dev enp1s0f0np0       # 10.100.0.2 on the worker — any one IPv4
+                                               # subnet shared by both CX-7 ifaces works
+ping -c3 -M do -s 8000 <peer-fabric-ip>          # ~<1 ms, no fragmentation
 ibv_devices                                      # expect 2 RoCE devs per box, e.g. rocep1s0f0 roceP2p1s0f0
 show_gids                                        # optional eyeball only: there must be a v2 row with an
                                                # IPv4 inside your subnet on every HCA named in NCCL_IB_HCA.
@@ -225,7 +230,9 @@ so use them as envelopes, not promises.
 3. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** for a bigger pool (capetron ran it at TP2; the
    repo's single-node 1M profiles use it with a quality cost — re-run retrieval checks).
 4. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`): prefill +10–19% (#52),
-   decode neutral.
+   decode neutral. With Sync-preset pairs the two QSFP links often sit in different
+   /24s — set `ROCE_SUBNET` to a supernet covering both (the GID preflight checks
+   every HCA against that one range).
 5. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
    TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
 6. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): the patch
