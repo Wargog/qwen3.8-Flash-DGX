@@ -175,11 +175,14 @@ line is the §2 table's flags (`--tensor-parallel-size 2 --nnodes 2 --node-rank 
 ### 3.7 Verify
 
 ```shell
+# take NAME/MASTER_ADDR/PORT from the profile (wherever you launched from):
+set -a; . profiles/default-tp2.env; set +a; NAME="${NAME:-qwen38-flash-tp2}"
 # transport first: one channel line per connection
 docker logs "$NAME" 2>&1 | grep -o 'via NET/[A-Z/]*' | sort | uniq -c     # NET/IB — good; NET/Socket — fix §3.1/§4
 # API (head node):
-curl -s localhost:18300/v1/models | head -c 200
-NAME=qwen38-flash-tp2 FLASH_API_BASE=http://$MASTER_ADDR:18300/v1 ./flash test
+curl -s "http://${MASTER_ADDR}:${PORT:-18300}/v1/models" | head -c 200
+NAME="$NAME" FLASH_API_BASE="http://${MASTER_ADDR}:${PORT:-18300}/v1" ./flash wait
+NAME="$NAME" FLASH_API_BASE="http://${MASTER_ADDR}:${PORT:-18300}/v1" ./flash test
 scripts/greedy-probe.sh            # fresh vs repeat must agree (TP+prefix-cache canary)
 ```
 
