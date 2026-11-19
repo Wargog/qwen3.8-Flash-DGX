@@ -2,7 +2,8 @@
 # serve-tp2.sh — EXPERIMENTAL: run Qwen3.8-Flash-Next TP=2 across two DGX Sparks.
 #
 # Primarily written by an AI agent (from issue #52, the x00byte and capetron
-# dual-Spark recipes and the NVIDIA playbooks) and NOT validated on a live
+# dual-Spark recipes, MiaAI-Lab dual-Spark #73, the NVIDIA playbooks and the
+# NCCL env docs) and NOT validated on a live
 # pair; docs/MULTI-NODE-TP2.md carries the failure table and acceptance
 # checks. flash/serve.sh stay single-node on purpose: a bridged, port-mapped
 # container cannot join a multi-node mp group (cross-node NCCL and the torch
@@ -36,6 +37,12 @@ esac
 [ "${DRAFT_VOCAB:-1}" = 0 ] || { echo "!! DRAFT_VOCAB crashes at TP>1 (global ids vs the row-sharded lm_head, issue #52) — set DRAFT_VOCAB=0"; exit 1; }
 [ "${PLE_MMAP:-0}" = 0 ] || { echo "!! the PLE mmap hook is untested under TP — set PLE_MMAP=0 (the table fits resident on a pair)"; exit 1; }
 [ "${YARN:-0}" = 0 ] || echo "!! note: YaRN beyond native CTX has never been verified on TP — expect to re-doctor this"
+ROCE_SUBNET="${ROCE_SUBNET:?ROCE_SUBNET=fabric subnet CIDR, the one shared by both RoCE interfaces}"
+if [ -n "${NCCL_IB_GID_INDEX:-}" ]; then
+  echo "!! note: NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX is IGNORED by this lane."
+  echo "   Pinned GID indices drift when one node reboots alone (MiaAI-Lab dual-Spark #73);"
+  echo "   NCCL resolves the RoCEv2 GID per rank from NCCL_IB_ADDR_RANGE=$ROCE_SUBNET instead."
+fi
 
 PEER="${PEER:?PEER=user@worker-fabric-ip}"
 MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR=head node fabric ip}"
@@ -66,6 +73,57 @@ ssh "$PEER" "docker image inspect $IMAGE >/dev/null 2>&1" \
 ssh "$PEER" "test -d '$REPO_DIR/snapshots/$(basename "$SNAP")'" \
   || { echo "!! snapshot not on $PEER at $REPO_DIR — rsync the whole $HF_CACHE across"; exit 1; }
 
+# RoCEv2 GID indices are NOT stable: a one-sided reboot or an address
+# add/remove leaves holes in a port's GID table and displaces the RoCE v2 IPv4
+# entry (MiaAI-Lab dual-Spark issue #73). So this launcher never sets
+# NCCL_IB_GID_INDEX — NCCL (>=2.21) resolves the v2 GID per rank from
+# NCCL_IB_ADDR_FAMILY/ADDR_RANGE/ROCE_VERSION_NUM — but both nodes' tables are
+# preflighted here so an out-of-range or empty match fails in one second with a
+# named node, instead of a crash loop of rendezvous timeouts. $3 lets tests
+# point at a fake sysfs tree.
+GID_PROBE='hcas=$1; subnet=$2; root=${3:-/sys/class/infiniband}
+ip=${subnet%%/*}; mask=${subnet##*/}; shift=$((32 - mask))
+IFS=. read -r a b c d <<X
+$ip
+X
+target=$((( (a<<24) + (b<<16) + (c<<8) + d ) >> shift))
+found=""; fail=0
+OLDIFS=$IFS; IFS=,
+for hca in $hcas; do
+  hit=""
+  i=0
+  while [ "$i" -le 31 ]; do
+    t=$(cat "$root/$hca/ports/1/gid_attrs/types/$i" 2>/dev/null)
+    if [ "$t" = "RoCE v2" ]; then
+      g=$(cat "$root/$hca/ports/1/gids/$i" 2>/dev/null)
+      case $g in
+        0000:0000:0000:0000:0000:ffff:*)
+          pair=${g##*ffff:}
+          n=$((( 0x${pair%%:*} << 16 ) + 0x${pair##*:}))
+          if [ $(( n >> shift )) -eq "$target" ]; then hit="$hca:$i"; break; fi
+          ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  if [ -z "$hit" ]; then echo "no RoCE v2 IPv4 GID inside $subnet on $hca" >&2; fail=1; fi
+  found="$found $hit"
+done
+IFS=$OLDIFS
+[ $fail -eq 0 ] || exit 1
+echo $found'
+gid_check() {  # $1 = ssh target ('' = this node)
+  local prefix=""
+  [ -n "$1" ] && prefix="ssh $1 "
+  ${prefix}sh -s -- "$NCCL_IB_HCA" "$ROCE_SUBNET" "${GID_ROOT:-}" <<< "$GID_PROBE"
+}
+echo ">> RoCEv2 GID preflight (want a v2 IPv4 GID inside $ROCE_SUBNET on: $NCCL_IB_HCA)"
+HEAD_GIDS="$(gid_check "" )" \
+  || { echo "!! head has no usable RoCE v2 GID — run: show_gids   (rebooting both nodes together repacks the tables)"; exit 1; }
+WORKER_GIDS="$(gid_check "$PEER" )" \
+  || { echo "!! worker has no usable RoCE v2 GID — run: ssh $PEER show_gids   (or reboot both nodes together)"; exit 1; }
+echo "   head:$HEAD_GIDS   worker:$WORKER_GIDS   (indices may differ — that is fine, nothing pins them)"
+
 EAGER_ARGS=(--enforce-eager); [ "${EAGER:-1}" = 1 ] || EAGER_ARGS=(-cc.cudagraph_mode=PIECEWISE)
 # (piecewise note: serve.sh's splitting_ops list is not needed here — with the
 #  mmap hook off the PLE custom op doesn't exist and vLLM's default attention-op
@@ -82,7 +140,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
     -e VLLM_PLE_MMAP=0 -e VLLM_USE_FLASHINFER_SAMPLER=1
     -e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so
     -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
-    -e "NCCL_IB_HCA=$NCCL_IB_HCA" -e "NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX"
+    -e "NCCL_IB_HCA=$NCCL_IB_HCA"
     -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e "NCCL_IB_ADDR_RANGE=$ROCE_SUBNET"
     -e "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME" -e "GLOO_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME" -e "TP_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
     -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CUMEM_ENABLE=0

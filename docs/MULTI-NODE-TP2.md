@@ -42,6 +42,7 @@ gain at 4+ clients is small (~+9% in #52). You buy latency and context, not thro
 | 10 | "no config.json" / dangling links in the container | HF snapshot dirs are **relative** symlinks into `../../blobs`; mounting only the snapshot breaks them | Mount the whole `$HF_CACHE` (what `serve.sh`/the launcher below do) |
 | 11 | vLLM worker vanishes ~10% into a load, `OOMKilled=false`, no traceback | `earlyoom`'s default 10% MemAvailable floor kills the worker | `systemctl is-enabled earlyoom` on both boxes; disable or raise the floor |
 | 12 | Load fails once per boot (`operation not permitted` on worker, gloo "connection closed" on head) | Un-root-caused first-load-after-boot defect, one NVFP4 2-node config ([capetron traps](https://capetron.github.io/gb10-cluster-guide/serving-models/)) | Reboot both nodes; keep stacks identical across reboots |
+| 13 | `Call to ibv_modify_qp failed with 61 ... local GID ::` right after channels come up — often only after ONE node rebooted | Pinned `NCCL_IB_GID_INDEX` + unstable GID table indices: reboots and address add/remove leave holes that displace the RoCEv2 IPv4 entry, and the two nodes' (or two HCAs') tables disagree ([MiaAI-Lab dual-Spark #73](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks/issues/73)) | Don't pin the index: leave `NCCL_IB_GID_INDEX` unset and let NCCL ≥2.21 resolve the v2 GID per rank from `NCCL_IB_ADDR_FAMILY=AF_INET` + `NCCL_IB_ADDR_RANGE=$ROCE_SUBNET` + `NCCL_IB_ROCE_VERSION_NUM=2` (what `serve-tp2.sh` does; it also preflights both nodes' GID tables before launch) |
 
 Model-side issues that are *not* TP-specific but still apply (you keep all the repo's
 image patches, so you get the prefix-cache/Mamba fixes): [#73](https://github.com/blazux/qwen3.8-Flash-DGX/issues/73)
@@ -75,12 +76,17 @@ Follow NVIDIA's [Connect Multiple DGX Sparks](https://build.nvidia.com/spark/con
 playbook. The minimum that matters here:
 
 ```shell
-# link up at 200G, MTU 9000, one IPv4 /24 shared by the two nodes on the CX-7 iface
+# link up at 200G, MTU 9000, one IPv4 subnet shared by the two nodes on the CX-7 iface
 ip link set dev enp1s0f0np0 mtu 9000            # your iface name: `ls /sys/class/infiniband` + `ip a`
-ip addr add 192.168.200.1/24 dev enp1s0f0np0    # .2 on the worker
+ip addr add 192.168.200.1/24 dev enp1s0f0np0    # .2 on the worker — or just keep the addresses
+                                               # the boxes came with (often 10.x); ROCE_SUBNET only
+                                               # has to name whichever subnet both RoCE ifaces share
 ping -c3 -M do -s 8000 192.168.200.2             # ~<1 ms, no fragmentation
 ibv_devices                                      # expect 2 RoCE devs per box, e.g. rocep1s0f0 roceP2p1s0f0
-show_gids                                        # note the RoCEv2 IPv4 index -> NCCL_IB_GID_INDEX (3 on DGX OS 7.6, 5 elsewhere)
+show_gids                                        # optional eyeball only: there must be a v2 row with an
+                                               # IPv4 inside your subnet on every HCA named in NCCL_IB_HCA.
+                                               # Do NOT pin its index — see §1 #13; serve-tp2.sh resolves
+                                               # it per rank and preflights both tables at launch
 ib_write_bw -d rocep1s0f0                        # worker; head: ib_write_bw -d rocep1s0f0 <peer-ip>  -> ~98 Gb/s per rail
 ```
 
@@ -123,7 +129,9 @@ docker ps                                    # no other GPU containers
 Shipped in this checkout (EXPERIMENTAL; primarily AI-authored — see the banner at
 the top). `./flash doctor tp2` cross-checks it against the §1 failure table; edit
 only the fabric block at the end (`NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`,
-`NCCL_IB_GID_INDEX`, `ROCE_SUBNET`) to match §3.1. The settings that matter and
+`ROCE_SUBNET`) to match §3.1 — there is deliberately no `NCCL_IB_GID_INDEX`:
+pinned indices break on one-sided reboots (§1 #13), so the RoCEv2 GID is resolved
+by address range instead. The settings that matter and
 why: `MODE=nvfp4` (§1 #2), `DRAFT_VOCAB=0` (§1 #3), `PLE_MMAP=0` (§1 #4),
 `CTX=262144` native (YaRN unverified on TP), `BATCH_TOKENS=8192` (larger measured
 worse, #52), `EAGER=1` for the first bring-up (§1 #8), `GPU_MEM=0.80`
@@ -142,11 +150,14 @@ PEER=user@<worker-fabric-ip> MASTER_ADDR=<head-fabric-ip> scripts/serve-tp2.sh [
 ```
 
 It applies the §1 guards (hybrid/draft-vocab/mmap/YARN), checks image and
-snapshot parity on the worker first (§1 #9/#10), drops the page cache on both
+snapshot parity on the worker first (§1 #9/#10), resolves the RoCEv2 GID on BOTH
+nodes' GID tables and refuses to start if either has none in `ROCE_SUBNET`
+(§1 #13), drops the page cache on both
 boxes, then starts **rank 1 (`--headless`) first, then rank 0** (§1 #7/#12). The
 container assembly is `--network host --device=/dev/infiniband --ulimit
 memlock=-1:-1 --ulimit nofile=1048576:1048576 --cap-add IPC_LOCK` plus the
-NCCL-over-RoCE env block (`NCCL_NET=IB`, `NCCL_IB_HCA/GID_INDEX/ADDR_RANGE`, the
+NCCL-over-RoCE env block (`NCCL_NET=IB`, `NCCL_IB_HCA`, the
+`NCCL_IB_ADDR_FAMILY/RANGE` pair — no pinned GID index, §1 #13 — the
 `*_SOCKET_IFNAME` trio, `NCCL_CUMEM_ENABLE=0`, `NCCL_NVLS_ENABLE=0`), and the vLLM
 line is the §2 table's flags (`--tensor-parallel-size 2 --nnodes 2 --node-rank …
 --distributed-executor-backend mp`, MTP via `--speculative-config`,
@@ -186,6 +197,8 @@ so use them as envelopes, not promises.
 - **Restart:** `scripts/serve-tp2.sh` recreates both containers; a stopped pair can't
   be `docker start`ed back into TP — the rendezvous is per-launch. Recreate instead.
 - **One node reboots → reboot both** before the next launch if you hit issue table #12.
+  GID-table drift from a one-sided reboot is now handled (§1 #13): nothing pins an
+  index, and the launch preflight names the node if a table goes stale/empty.
 - **Quality:** run the repo's `./flash test` and a tool-calling check after any stack
   change; #52 validated needles + first-token logprob agreement cold vs cached on TP2.
 
@@ -221,6 +234,7 @@ so use them as envelopes, not promises.
 - Repo: [issue #52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52) (setup, RoCE flags, the two TP bugs, benches), issues #2, #31, #73, docs/HOW-IT-WORKS.md, docs/PREFIX-CACHE-WORKAROUND.md.
 - [x00byte/Qwen3.8-Flash-Dual-Spark-Recipe](https://github.com/x00byte/Qwen3.8-Flash-Dual-Spark-Recipe) — `mp`+`--headless` launch lines, enforce-eager lockup, PLE fp8 scale bug (day-zero dev image), caches/drop_caches, tool-eval 91/100.
 - [capetron GB10 cluster guide](https://capetron.github.io/gb10-cluster-guide/serving-models/) — measured TP2/TP4+EP/6-node results for this model, NCCL env set, earlyoom, digest pinning, hyper-connection PP limit.
+- [MiaAI-Lab dual-Spark issue #73](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks/issues/73) — GID-table index drift on one-sided reboots; why `NCCL_IB_GID_INDEX` must not be pinned. [NCCL env docs](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html) — `NCCL_IB_ADDR_FAMILY`/`ADDR_RANGE`/`ROCE_VERSION_NUM` drive selection only when `GID_INDEX` is unset.
 - [vLLM parallelism docs](https://docs.vllm.ai/en/latest/serving/parallelism_scaling/) — `--nnodes/--node-rank/--headless`, GPUDirect flags, `NET/IB` vs `NET/Socket` verification.
 - NVIDIA: [Connect Multiple DGX Sparks](https://build.nvidia.com/spark/connect-multiple-sparks), [vLLM cluster playbook](https://build.nvidia.com/playbooks/vllm-cluster) ([eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)), forum threads [366127](https://forums.developer.nvidia.com/t/nccl-all-reduce-deadlock-on-dual-dgx-spark-after-successful-channel-establishment-affects-both-vllm-and-trt-llm/366127) (deadlock, fixed by stack update) and [383023](https://forums.developer.nvidia.com/t/dgx-spark-regression-kernel-7-0-0-1019-nvidia-causes-nccl-roce-ibv-reg-mr-iova2-enomem-6-17-0-1032-works/383023) (kernel RoCE regression).
 
