@@ -141,10 +141,16 @@ SPEC="\"method\":\"mtp\",\"num_speculative_tokens\":${MTP:-4}"
 
 launch() {  # $1 = rank, $2 = ssh target ('' = this node)
   local rank="$1" host="$2"
+  # vLLM otherwise advertises the head's DEFAULT-ROUTE IP (the management NIC)
+  # as mq_connect_ip for the headless<->head RPC, and the worker silently stalls
+  # at startup if it has no route there. Pin it per rank to the fabric address.
+  local host_ip="$MASTER_ADDR"
+  [ "$rank" = 0 ] || host_ip="${PEER#*@}"
   local docker_args=(run -d --name "$NAME" --restart unless-stopped --gpus all --ipc=host
     --network host --device=/dev/infiniband
     --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 --cap-add IPC_LOCK
     -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1
+    -e "VLLM_HOST_IP=$host_ip"
     -e VLLM_PLE_MMAP=0 -e VLLM_USE_FLASHINFER_SAMPLER=1
     -e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so
     -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
