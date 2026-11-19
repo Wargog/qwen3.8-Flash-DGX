@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next at TP=2 across two DGX Sparks — profile guide
 
-> **Status: EXPERIMENTAL — this page, `profiles/tp2.env` and `scripts/serve-tp2.sh`
+> **Status: EXPERIMENTAL — this page, `profiles/default-tp2.env` and `scripts/serve-tp2.sh`
 > were primarily written by an AI agent** (Hermes, 2026-11-19), assembled from
 > [issue #52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52), the
 > [x00byte dual-Spark recipe](https://github.com/x00byte/Qwen3.8-Flash-Dual-Spark-Recipe),
@@ -124,11 +124,13 @@ echo 3 | sudo tee /proc/sys/vm/drop_caches    # right before launch (§3.6); war
 docker ps                                    # no other GPU containers
 ```
 
-### 3.5 The profile — `profiles/tp2.env`
+### 3.5 The profile — `profiles/default-tp2.env`
 
 Shipped in this checkout (EXPERIMENTAL; primarily AI-authored — see the banner at
-the top). `./flash doctor tp2` cross-checks it against the §1 failure table; edit
-only the fabric block at the end (`NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`,
+the top; it is `serve-tp2.sh`'s default profile). `./flash doctor default-tp2`
+cross-checks it against the §1 failure table; edit
+only the fabric block at the end (`MASTER_ADDR`, `PEER`,
+`NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`,
 `ROCE_SUBNET`) to match §3.1 — there is deliberately no `NCCL_IB_GID_INDEX`:
 pinned indices break on one-sided reboots (§1 #13), so the RoCEv2 GID is resolved
 by address range instead. The settings that matter and
@@ -146,7 +148,8 @@ containers use `--network host`), and serve.sh's fixed `-e VLLM_PLE_MMAP=1` is t
 config §1 #4 says not to use. Run on the head node:
 
 ```shell
-PEER=user@<worker-fabric-ip> MASTER_ADDR=<head-fabric-ip> scripts/serve-tp2.sh [profile]
+scripts/serve-tp2.sh [profile]      # profile defaults to default-tp2;
+                                    # MASTER_ADDR/PEER come from its fabric block
 ```
 
 It applies the §1 guards (hybrid/draft-vocab/mmap/YARN), checks image and

@@ -11,7 +11,9 @@
 # --network host).
 #
 # Run on the HEAD node:
-#   PEER=user@<worker-fabric-ip> MASTER_ADDR=<head-fabric-ip> scripts/serve-tp2.sh [profile]
+#   scripts/serve-tp2.sh [profile]        (default profile: default-tp2)
+# PEER/MASTER_ADDR are set in the profile's fabric block; environment values
+# still override, for ad-hoc runs.
 #
 # Both nodes need: this checkout at the same commit, the same image (ship it:
 # docker save | zstd | ssh worker 'zstd -d | docker load'), the whole
@@ -19,11 +21,17 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROFILE="${1:-tp2}"
+PROFILE="${1:-default-tp2}"
 PROF_FILE="$HERE/profiles/${PROFILE}.env"
 [ -f "$PROF_FILE" ] || { echo "!! no profile $PROF_FILE — see: ./flash profiles"; exit 1; }
-# shellcheck disable=SC1090
-source "$PROF_FILE"
+# Same semantics as flash's load_profile: variables ALREADY in the environment
+# win; the profile only fills in what is unset (so `MASTER_ADDR=... scripts/
+# serve-tp2.sh` still works for ad-hoc runs). No inline comments in profiles.
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|'#'*) continue ;; esac
+  key="${line%%=*}"; val="${line#*=}"; val="${val%\"}"; val="${val#\"}"
+  if [ -z "${!key+x}" ]; then export "$key=$val"; fi
+done < "$PROF_FILE"
 
 TP_SIZE="${TP_SIZE:-2}"; [ "$TP_SIZE" = 2 ] || { echo "!! this launcher knows TP_SIZE=2 only (two Sparks, one GB10 each)"; exit 1; }
 case "${MODE:-nvfp4}" in
@@ -44,8 +52,8 @@ if [ -n "${NCCL_IB_GID_INDEX:-}" ]; then
   echo "   NCCL resolves the RoCEv2 GID per rank from NCCL_IB_ADDR_RANGE=$ROCE_SUBNET instead."
 fi
 
-PEER="${PEER:?PEER=user@worker-fabric-ip}"
-MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR=head node fabric ip}"
+PEER="${PEER:?set PEER=user@<worker-fabric-ip> in the profile fabric block}"
+MASTER_ADDR="${MASTER_ADDR:?set MASTER_ADDR=<head fabric ip> in the profile fabric block}"
 NAME="${NAME:-qwen38-flash-tp2}"; IMAGE="${IMAGE:-qwen38-flash-dgx:v0.33}"
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
