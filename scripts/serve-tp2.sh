@@ -44,7 +44,8 @@ case "${MODE:-nvfp4}" in
 esac
 [ "${DRAFT_VOCAB:-1}" = 0 ] || { echo "!! DRAFT_VOCAB crashes at TP>1 (global ids vs the row-sharded lm_head, issue #52) — set DRAFT_VOCAB=0"; exit 1; }
 [ "${PLE_MMAP:-0}" = 0 ] || { echo "!! the PLE mmap hook is untested under TP — set PLE_MMAP=0 (the table fits resident on a pair)"; exit 1; }
-[ "${YARN:-0}" = 0 ] || echo "!! note: YaRN beyond native CTX has never been verified on TP — expect to re-doctor this"
+[ "${CTX:-262144}" -le 262144 ] || [ "${YARN:-0}" != 0 ] || { echo "!! CTX=${CTX:-262144} exceeds native 262144 without YaRN — set YARN=1 or lower CTX"; exit 1; }
+[ "${YARN:-0}" = 0 ] || echo "!! note: YaRN is wired here (--hf-overrides factor 4 + draft max_model_len, same recipe as serve.sh) but has never RUN on TP — before trusting it, gate on retrieval at CTX + scripts/greedy-probe.sh"
 ROCE_SUBNET="${ROCE_SUBNET:?ROCE_SUBNET=fabric subnet CIDR, the one shared by both RoCE interfaces}"
 if [ -n "${NCCL_IB_GID_INDEX:-}" ]; then
   echo "!! note: NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX is IGNORED by this lane."
@@ -138,6 +139,8 @@ EAGER_ARGS=(--enforce-eager); [ "${EAGER:-1}" = 1 ] || EAGER_ARGS=(-cc.cudagraph
 #  list applies.)
 SPEC="\"method\":\"mtp\",\"num_speculative_tokens\":${MTP:-4}"
 [ "${YARN:-0}" != 0 ] && SPEC="$SPEC,\"max_model_len\":${CTX}"
+# same published YaRN recipe serve.sh uses (factor 4 over the native 262144)
+YARN_OVR='{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
 
 launch() {  # $1 = rank, $2 = ssh target ('' = this node)
   local rank="$1" host="$2"
@@ -146,11 +149,13 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
   # at startup if it has no route there. Pin it per rank to the fabric address.
   local host_ip="$MASTER_ADDR"
   [ "$rank" = 0 ] || host_ip="${PEER#*@}"
+  local allow_long=0
+  [ "${YARN:-0}" != 0 ] && allow_long=1
   local docker_args=(run -d --name "$NAME" --restart unless-stopped --gpus all --ipc=host
     --network host --device=/dev/infiniband
     --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 --cap-add IPC_LOCK
     -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1
-    -e "VLLM_HOST_IP=$host_ip"
+    -e "VLLM_HOST_IP=$host_ip" -e "VLLM_ALLOW_LONG_MAX_MODEL_LEN=$allow_long"
     -e VLLM_PLE_MMAP=0 -e VLLM_USE_FLASHINFER_SAMPLER=1
     -e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so
     -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
@@ -169,6 +174,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
     --tool-call-parser qwen3_coder --reasoning-parser qwen3
     --speculative-config "{$SPEC}" "${EAGER_ARGS[@]}")
   [ -n "${MAMBA_SSM_DTYPE:-}" ] && vllm_args+=(--mamba-ssm-cache-dtype "$MAMBA_SSM_DTYPE")
+  [ "${YARN:-0}" != 0 ] && vllm_args+=(--hf-overrides "$YARN_OVR")
   [ "${PREFIX_CACHE:-1}" = 1 ] && vllm_args+=(--enable-prefix-caching) || vllm_args+=(--no-enable-prefix-caching)
   [ "$rank" != 0 ] && vllm_args+=(--headless)   # without it: "collective_rpc should not be called on follower node"
   if [ -z "$host" ]; then docker "${docker_args[@]}" "$IMAGE" "${vllm_args[@]}" ${EXTRA:-}
@@ -189,4 +195,4 @@ echo ">> worker (rank 1) first, then head (rank 0)"
 launch 1 "$PEER"; launch 0 ""
 echo ">> follow: docker logs -f $NAME   and   ssh $PEER docker logs -f $NAME"
 echo ">> check transport: docker logs $NAME 2>&1 | grep -o 'via NET/[A-Z/]*' | sort | uniq -c   (NET/IB, not NET/Socket)"
-echo ">> ready: export NAME=\"$NAME\" FLASH_API_BASE=\"http://$MASTER_ADDR:$PORT/v1\"  then ./flash wait && ./flash test"
+echo ">> ready: export NAME=\"$NAME\" FLASH_API_BASE=127.0.0.1:$PORT  then ./flash wait && ./flash test   (FLASH_API_BASE = host:port only; remote clients: http://$MASTER_ADDR:$PORT/v1)"

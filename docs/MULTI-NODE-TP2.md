@@ -141,7 +141,7 @@ only the fabric block at the end (`MASTER_ADDR`, `PEER`,
 pinned indices break on one-sided reboots (§1 #13), so the RoCEv2 GID is resolved
 by address range instead. The settings that matter and
 why: `MODE=nvfp4` (§1 #2), `DRAFT_VOCAB=0` (§1 #3), `PLE_MMAP=0` (§1 #4),
-`CTX=262144` native (YaRN unverified on TP), `BATCH_TOKENS=8192` (larger measured
+`CTX=262144` native by default (YaRN wired, first-of-kind on TP - see 7.1), `BATCH_TOKENS=8192` (larger measured
 worse, #52), `EAGER=1` for the first bring-up (§1 #8), `GPU_MEM=0.80`
 (≥0.85 leaves a 1–4% MemAvailable floor on the unified pool).
 
@@ -176,14 +176,16 @@ line is the §2 table's flags (`--tensor-parallel-size 2 --nnodes 2 --node-rank 
 ### 3.7 Verify
 
 ```shell
-# take NAME/MASTER_ADDR/PORT from the profile (wherever you launched from):
+# take NAME/PORT from the profile (wherever you launched from):
 set -a; . profiles/default-tp2.env; set +a; NAME="${NAME:-qwen38-flash-tp2}"
+export NAME FLASH_API_BASE="127.0.0.1:${PORT:-18300}"
+# FLASH_API_BASE is host:port ONLY - no scheme, no /v1 (flash/smoke-test append
+# the path themselves). From another machine, use host:port of the head's fabric IP.
 # transport first: one channel line per connection
 docker logs "$NAME" 2>&1 | grep -o 'via NET/[A-Z/]*' | sort | uniq -c     # NET/IB — good; NET/Socket — fix §3.1/§4
 # API (head node):
-curl -s "http://${MASTER_ADDR}:${PORT:-18300}/v1/models" | head -c 200
-NAME="$NAME" FLASH_API_BASE="http://${MASTER_ADDR}:${PORT:-18300}/v1" ./flash wait
-NAME="$NAME" FLASH_API_BASE="http://${MASTER_ADDR}:${PORT:-18300}/v1" ./flash test
+curl -s "http://127.0.0.1:${PORT:-18300}/v1/models" | head -c 200
+./flash wait && ./flash test
 scripts/greedy-probe.sh            # fresh vs repeat must agree (TP+prefix-cache canary)
 ```
 
@@ -222,29 +224,36 @@ so use them as envelopes, not promises.
 ## 6. What you should NOT try (measured failures)
 
 - `MODE=hybrid` unchanged at TP>1 (issue table #2), `DRAFT_VOCAB=1` unchanged (#3),
-  YaRN >262k (untested on TP), `BATCH_TOKENS=32768` (#52: worse both metrics),
+  YaRN >262k without the section 7.1 gates (wired now, but never run on TP), `BATCH_TOKENS=32768` (#52: worse both metrics),
   TCP-only transport (#52: slower than one node), TP4 without `--enable-expert-parallel`,
   any PP split of this model.
 
 ## 7. Optional upgrades, in order of payoff
 
-1. **Hybrid checkpoint on TP** (the +20% decode): run `prepare-hybrid.sh` with the
+1. **YaRN context scaling (`YARN=1`, `CTX=450000`–`500000`)** — the highest-reward
+   item: the pair's 1.4–1.9M KV pool comfortably carries 500k single-stream or
+   several long clients that one Spark can't serve at all. `serve-tp2.sh` wires the
+   full single-node recipe (`--hf-overrides` factor 4, `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`,
+   draft-model `max_model_len`). **Never run on TP by anyone** (#52/x00byte/capetron
+   all ran native 262k): after first boot, gate on retrieval at ~90% of CTX +
+   `scripts/greedy-probe.sh` + a long-context quality spot-check before trusting output.
+2. **Hybrid checkpoint on TP** (the +20% decode): run `prepare-hybrid.sh` with the
    shared experts excluded, per #52 — edit a copy of `tools/fp8_convert.py` `TARGETS`
    to drop the `mlp.shared_expert.*` line (they stay bf16; 1692 tensors convert
    instead of 1836), then serve the `-fp8hybrid` layout with `MODE=hybrid` and
    `VLLM_FP8_HYBRID=1 -e VLLM_USE_DEEP_GEMM=0`. (Inference: the repo's hybrid hook
    reads scales per tensor, so leaving one family unconverted only costs bandwidth.)
-2. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
+3. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
    offered as a PR and never merged; port it into `src/` as patch 10b).
-3. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** for a bigger pool (capetron ran it at TP2; the
+4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** for a bigger pool (capetron ran it at TP2; the
    repo's single-node 1M profiles use it with a quality cost — re-run retrieval checks).
-4. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`): prefill +10–19% (#52),
+5. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`): prefill +10–19% (#52),
    decode neutral. With Sync-preset pairs the two QSFP links often sit in different
    /24s — set `ROCE_SUBNET` to a supernet covering both (the GID preflight checks
    every HCA against that one range).
-5. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
+6. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
    TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
-6. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): the patch
+7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): the patch
    site (`mamba/abstract.py`) is per-rank and plausibly TP-safe, but nothing
    published has tested it on TP — treat as experimental.
 
