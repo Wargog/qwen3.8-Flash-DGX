@@ -158,7 +158,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
     -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e "NCCL_IB_ADDR_RANGE=$ROCE_SUBNET"
     -e "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME" -e "GLOO_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME" -e "TP_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
     -e NCCL_NVLS_ENABLE=0 -e NCCL_CROSS_NIC=0 -e NCCL_IB_MERGE_NICS=0 -e NCCL_CUMEM_ENABLE=0
-    -e NCCL_IGNORE_CPU_AFFINITY=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -e NCCL_DEBUG=WARN)
+    -e NCCL_IGNORE_CPU_AFFINITY=1 -e TORCH_NCCL_ASYNC_ERROR_HANDLING=1 -e "NCCL_DEBUG=${NCCL_DEBUG:-WARN}")
   local vllm_args=("$SNAP_IN" --served-model-name "$SERVED_MODEL_NAME" --host 0.0.0.0 --port "$PORT"
     --load-format safetensors --tensor-parallel-size 2 --nnodes 2 --node-rank "$rank"
     --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" --distributed-executor-backend mp

@@ -211,6 +211,11 @@ so use them as envelopes, not promises.
 - **One node reboots → reboot both** before the next launch if you hit issue table #12.
   GID-table drift from a one-sided reboot is now handled (§1 #13): nothing pins an
   index, and the launch preflight names the node if a table goes stale/empty.
+- **Stuck at the first NCCL comm init** (both ranks quiet after
+  `distributed_init_method=...`, like §1 #5): relaunch once with
+  `NCCL_DEBUG=INFO scripts/serve-tp2.sh` and diff the two containers' logs —
+  the last `NET/IB ...` / `Bootstrap ...` line names the rail or socket that
+  never completes. `NCCL_DEBUG=WARN` is the default the launcher otherwise sets.
 - **Quality:** run the repo's `./flash test` and a tool-calling check after any stack
   change; #52 validated needles + first-token logprob agreement cold vs cached on TP2.
 
