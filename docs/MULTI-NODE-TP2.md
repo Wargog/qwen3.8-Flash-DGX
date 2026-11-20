@@ -47,8 +47,8 @@ gain at 4+ clients is small (~+9% in #52). You buy latency and context, not thro
 
 Model-side issues that are *not* TP-specific but still apply (you keep all the repo's
 image patches, so you get the prefix-cache/Mamba fixes): [#73](https://github.com/blazux/qwen3.8-Flash-DGX/issues/73)
-greedy divergence on prefix hits (see `prefix-cache-safe` / `SPLIT_PREFILL=1` —
-**TP behavior of that workaround is untested**), [#31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31)
+greedy divergence on prefix hits (see `prefix-cache-safe` / `SPLIT_PREFILL=1`;
+its TP behavior is now verified — docs §7.7). [#31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31)
 turn termination on a literal control token. The single-node launcher's
 `EFFORT_ALIAS` template rewrite is now mirrored in `serve-tp2.sh` (the rewritten
 template is published to both hosts' caches and `--chat-template`-mounted in both
@@ -210,8 +210,9 @@ so use them as envelopes, not promises.
 First live bring-up of this lane (2026-11-20, eager MTP-4, both rails, native 262k):
 KV pool 1,427,137 tokens (5.44× concurrency at 262k), cold prefill 2,963 tok/s @10.7k
 (prefix-cache rerun 0.49 s), greedy decode 31.3 tok/s end-to-end incl. TTFT — all inside
-the eager columns above. **Open item:** the §3.7 first-token-logprob identity check
-diverged cold-vs-cached; see §7.7 (SPLIT_PREFILL experiment pending).
+the eager columns above. The §3.7 first-token-logprob identity check diverged
+cold-vs-cached on that run; relaunching with `SPLIT_PREFILL=1` (later the same day)
+passed every gate, including bit-identical logprobs across a prefix hit — see §7.7.
 
 ## 5. Day-2 operations
 
@@ -261,11 +262,15 @@ diverged cold-vs-cached; see §7.7 (SPLIT_PREFILL experiment pending).
 6. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
    TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
 7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): wired into
-   `serve-tp2.sh` (`-e VLLM_DGX_SPLIT_PREFILL=1`, per-rank, plausibly TP-safe but
-   unproven here). **Observed:** the first live TP2 pair (2026-11-20) failed the
-   §3.7 first-token-logprob identity check cold-vs-cached with the default settings;
-   this flag is the first thing to try when that happens, then re-run the logprob
-   check + `scripts/greedy-probe.sh`.
+   `serve-tp2.sh` (`-e VLLM_DGX_SPLIT_PREFILL`, the same knob the single-node
+   `prefix-cache-safe` profile uses; unlike `serve.sh` the TP launcher doesn't
+   check the image label — it assumes the patched lane image). **Verified on
+   TP2 (2026-11-20):** the first live pair failed the §3.7 first-token-logprob
+   identity check cold-vs-cached with `SPLIT_PREFILL=0` — greedy *text* stayed
+   identical, so it was scoring-path drift — and passed bit-identical, with the
+   prefix-cache hit still working, after relaunching with `SPLIT_PREFILL=1`.
+   That is why the `default-tp2` profile defaults it to 1: the #73 class is not
+   TP-specific, and neither is the fix.
 
 ## 8. Sources
 
