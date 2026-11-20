@@ -50,8 +50,9 @@ image patches, so you get the prefix-cache/Mamba fixes): [#73](https://github.co
 greedy divergence on prefix hits (see `prefix-cache-safe` / `SPLIT_PREFILL=1` —
 **TP behavior of that workaround is untested**), [#31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31)
 turn termination on a literal control token. The single-node launcher's
-`EFFORT_ALIAS` template rewrite isn't wired into the TP launcher, so
-`reasoning_effort: "high"` will 400 (same caveat #52 reported).
+`EFFORT_ALIAS` template rewrite is now mirrored in `serve-tp2.sh` (the rewritten
+template is published to both hosts' caches and `--chat-template`-mounted in both
+containers), so `reasoning_effort: "high"` works on the pair.
 
 Parallelism limits for this checkpoint (all measured, [capetron](https://capetron.github.io/gb10-cluster-guide/serving-models/)):
 TP2 is clean (640 → 320 per rank is fine); plain **TP4 fails to load**
@@ -206,6 +207,12 @@ cold and on a cache hit.
 Columns differ in recipe (YaRN 500k vs native 262k, graphs vs eager, fp8 vs bf16 KV),
 so use them as envelopes, not promises.
 
+First live bring-up of this lane (2026-11-20, eager MTP-4, both rails, native 262k):
+KV pool 1,427,137 tokens (5.44× concurrency at 262k), cold prefill 2,963 tok/s @10.7k
+(prefix-cache rerun 0.49 s), greedy decode 31.3 tok/s end-to-end incl. TTFT — all inside
+the eager columns above. **Open item:** the §3.7 first-token-logprob identity check
+diverged cold-vs-cached; see §7.7 (SPLIT_PREFILL experiment pending).
+
 ## 5. Day-2 operations
 
 - **Restart:** `scripts/serve-tp2.sh` recreates both containers; a stopped pair can't
@@ -253,9 +260,12 @@ so use them as envelopes, not promises.
    every HCA against that one range).
 6. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
    TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
-7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): the patch
-   site (`mamba/abstract.py`) is per-rank and plausibly TP-safe, but nothing
-   published has tested it on TP — treat as experimental.
+7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): wired into
+   `serve-tp2.sh` (`-e VLLM_DGX_SPLIT_PREFILL=1`, per-rank, plausibly TP-safe but
+   unproven here). **Observed:** the first live TP2 pair (2026-11-20) failed the
+   §3.7 first-token-logprob identity check cold-vs-cached with the default settings;
+   this flag is the first thing to try when that happens, then re-run the logprob
+   check + `scripts/greedy-probe.sh`.
 
 ## 8. Sources
 

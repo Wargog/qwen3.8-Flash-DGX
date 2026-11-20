@@ -73,6 +73,27 @@ done
 [ -n "$SNAP" ] || { echo "!! checkpoint not found under $REPO_DIR — ./flash setup first, then rsync the whole cache to $PEER"; exit 1; }
 SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$(basename "$SNAP")"
 
+# reasoning_effort aliases (mirror of serve.sh EFFORT_ALIAS=1): the NVIDIA template 400s on
+# high/max/minimal (Claude Code sends high). Rewrite the one effort-resolving line, publish the
+# copy to BOTH hosts' cache, serve it via --chat-template bind-mounted in both containers.
+TPL_ARGS=(); TPL_MNT=()
+TPL_SRC="$SNAP/chat_template.jinja"
+if [ "${EFFORT_ALIAS:-1}" = 1 ] && grep -qF "Supported types are xhigh (default), medium, and low." "$TPL_SRC" 2>/dev/null; then
+  EFFORT_OLD="{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"
+  EFFORT_NEW="{%- set resolved_reasoning_effort = {'high': 'xhigh', 'max': 'xhigh', 'minimal': 'low'}.get(reasoning_effort|default('xhigh'), reasoning_effort|default('xhigh')) %}"
+  if [ "$(grep -cF "$EFFORT_OLD" "$TPL_SRC")" = 1 ]; then
+    ALIAS_DIR="$HF_CACHE/qwen38-flash-dgx/chat-templates"; ALIAS="$ALIAS_DIR/$NAME.jinja"
+    T=""; IFS= read -r -d '' T < "$TPL_SRC" || true   # keeps trailing newlines, unlike $(cat)
+    if [ -n "$T" ] && mkdir -p "$ALIAS_DIR" 2>/dev/null \
+       && printf '%s%s' '{#- serve-tp2.sh (EFFORT_ALIAS): effort line rewritten, high/max -> xhigh, minimal -> low. -#}' \
+            "${T/"$EFFORT_OLD"/"$EFFORT_NEW"}" > "$ALIAS.tmp" 2>/dev/null && mv -f "$ALIAS.tmp" "$ALIAS"; then
+      ssh "$PEER" "mkdir -p '$ALIAS_DIR'" && scp -q "$ALIAS" "$PEER:$ALIAS" \
+        && { TPL_ARGS=(--chat-template /qwen38/chat_template.jinja); TPL_MNT=(-v "$ALIAS:/qwen38/chat_template.jinja:ro"); } \
+        || echo "!! EFFORT_ALIAS: could not publish the template copy to $PEER; reasoning_effort high will 400"
+    else echo "!! EFFORT_ALIAS: could not write the rewritten template copy under $ALIAS_DIR"; fi
+  else echo "!! EFFORT_ALIAS: the effort line is not the expected one (exactly once); serving the stock template"; fi
+fi
+
 # Environment parity is a correctness property here: a drifted image on the
 # worker shows up as the NCCL bootstrap error "Message truncated".
 have_image() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
@@ -151,12 +172,15 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
   [ "$rank" = 0 ] || host_ip="${PEER#*@}"
   local allow_long=0
   [ "${YARN:-0}" != 0 ] && allow_long=1
+  local split_flag=0
+  [ "${SPLIT_PREFILL:-0}" = 1 ] && split_flag=1
   local docker_args=(run -d --name "$NAME" --restart unless-stopped --gpus all --ipc=host
     --network host --device=/dev/infiniband
     --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 --cap-add IPC_LOCK
     -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1
     -e "VLLM_HOST_IP=$host_ip" -e "VLLM_ALLOW_LONG_MAX_MODEL_LEN=$allow_long"
     -e VLLM_PLE_MMAP=0 -e VLLM_USE_FLASHINFER_SAMPLER=1
+    -e "VLLM_QSA_EXACT_TOPK=${EXACT_TOPK:-0}" -e "VLLM_DGX_SPLIT_PREFILL=$split_flag"
     -e VLLM_QSA_DET_TOPK=1 -e VLLM_QSA_DET_LIB=/opt/llm/kernel-det/_C_det.so
     -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
     -e "NCCL_IB_HCA=$NCCL_IB_HCA"
@@ -175,6 +199,8 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
     --speculative-config "{$SPEC}" "${EAGER_ARGS[@]}")
   [ -n "${MAMBA_SSM_DTYPE:-}" ] && vllm_args+=(--mamba-ssm-cache-dtype "$MAMBA_SSM_DTYPE")
   [ "${YARN:-0}" != 0 ] && vllm_args+=(--hf-overrides "$YARN_OVR")
+  [ ${#TPL_MNT[@]} -gt 0 ] && docker_args+=("${TPL_MNT[@]}")
+  [ ${#TPL_ARGS[@]} -gt 0 ] && vllm_args+=("${TPL_ARGS[@]}")
   [ "${PREFIX_CACHE:-1}" = 1 ] && vllm_args+=(--enable-prefix-caching) || vllm_args+=(--no-enable-prefix-caching)
   [ "$rank" != 0 ] && vllm_args+=(--headless)   # without it: "collective_rpc should not be called on follower node"
   if [ -z "$host" ]; then docker "${docker_args[@]}" "$IMAGE" "${vllm_args[@]}" ${EXTRA:-}
