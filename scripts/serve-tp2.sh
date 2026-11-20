@@ -182,7 +182,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
 echo ">> $NAME: TP=2 (MODE=$MODE ctx=$CTX seqs=$SEQS kv=$KV_DTYPE mtp=${MTP:-4} eager=${EAGER:-1} prefix_cache=${PREFIX_CACHE:-1}) head=$MASTER_ADDR:$MASTER_PORT peer=$PEER"
 echo ">> dropping page caches on both nodes (warm cache starves the GB10 allocator mid-load)"
 echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-ssh "$PEER" 'echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null'
+ssh -t "$PEER" 'echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null'
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 ssh "$PEER" "docker rm -f $NAME" >/dev/null 2>&1 || true
 echo ">> worker (rank 1) first, then head (rank 0)"
