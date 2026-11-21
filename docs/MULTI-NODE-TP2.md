@@ -255,10 +255,16 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    offered as a PR and never merged; port it into `src/` as patch 10b).
 4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** for a bigger pool (capetron ran it at TP2; the
    repo's single-node 1M profiles use it with a quality cost — re-run retrieval checks).
-5. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`): prefill +10–19% (#52),
-   decode neutral. With Sync-preset pairs the two QSFP links often sit in different
-   /24s — set `ROCE_SUBNET` to a supernet covering both (the GID preflight checks
-   every HCA against that one range).
+5. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`) — LANDED: now the
+   `default-tp2.env` default, verified on a live pair 2026-11-20 (NCCL striped
+   1,694/1,616 MiB across the two HCAs per ~10k-token prefill burst; consistent
+   with #52's prefill +10–19%, decode neutral). With Sync-preset pairs the two
+   QSFP links often sit in different /24s — set `ROCE_SUBNET` to a supernet
+   covering both (the GID preflight checks every HCA against that one range).
+   Check a live instance by diffing
+   `/sys/class/infiniband/<dev>/ports/1/counters/port_{xmit,rcv}_data` (4-byte
+   words, 32-bit wrap) around a cold prefill — `/sys/class/net` statistics do
+   NOT see GPU-direct RDMA traffic and will wrongly show idle rails.
 6. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
    TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
 7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): wired into
