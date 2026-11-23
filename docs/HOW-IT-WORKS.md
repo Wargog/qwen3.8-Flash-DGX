@@ -95,7 +95,7 @@ Measured on the GX10 with the mmap patch, `GPU_MEM=0.85`, MTP=2 unless noted.
 | 262144 native, MTP | KV pool ~720–790k tokens, ~3× concurrency at full length. Baseline prod. |
 | **YaRN, CTX 500000, MTP** | **Works.** Pool ~724k tokens. Needle-in-a-haystack found at 276k and 414k tokens; decode 25–28 tok/s typical (36 on predictable text, ~94% draft acceptance there); no OOM. **This is the validated ceiling.** |
 | YaRN, CTX 800000, MTP, `GPU_MEM=0.875` | Boots (pool 928k) and answers, but a 300k-token prefill got **SIGTERM from earlyoom** at 1.96% free memory: the prefill's activation peak plus the draft do not fit in ~5 GiB of headroom. |
-| `--kv-cache-dtype fp8_e4m3` | Refused by the stock model (`QSA requires a BF16 main KV cache`); enabled by @Nanetnounou's patch in this image — see [fp8 KV cache](#fp8-kv-cache-on-the-qsa-path-opt-in). In bf16 a single 1M request needs 26.3 GiB of KV (28 KB/token, of which the attention K/V is the only part fp8 halves). |
+| `--kv-cache-dtype fp8_e4m3` | Refused by the stock model (`QSA requires a BF16 main KV cache`); enabled by @Nanetnounou's patch in this image — see [fp8 KV cache](#fp8-kv-cache-on-the-qsa-path). In bf16 a single 1M request needs 26.3 GiB of KV (28 KB/token, of which the attention K/V is the only part fp8 halves). |
 
 Two YaRN-specific traps, both handled by `scripts/serve.sh`:
 
@@ -610,7 +610,11 @@ our kernel.
 Patches 12 and 13 target the v0.30 parser engine; the 30-case test module passes. Patches 3, 9
 and 11 of the earlier bases are upstream fixes that v0.30 ships (vllm#50729, vllm#52775, vllm#55513).
 
-## fp8 KV cache on the QSA path (opt-in)
+## fp8 KV cache on the QSA path
+
+**Default since v0.33**: the `default`/`mtp-fast` profile ships `KV_DTYPE=fp8_e4m3`
+(500k tournament: 88.4% fp8 over 3 runs vs 87.8% bf16 — quality is not the cost;
+the costs are −3..−17% prefill, −4% decode, and 3,184-token prefix-cache blocks).
 
 `src/patch_qsa_fp8_kv.py`, after [@Nanetnounou](https://github.com/Nanetnounou)'s original for the
 preview image ([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6)). vLLM quantizes on

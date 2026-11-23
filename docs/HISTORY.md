@@ -221,7 +221,8 @@ Newest first. If you cloned this before, this is the short version; details in t
   it. Numbers in [docs/HOW-IT-WORKS.md](HOW-IT-WORKS.md#hybrid-mode-nvfp4-experts--blockwise-fp8-side-layers).
 - **fp8 KV cache is available** (`KV_DTYPE=fp8_e4m3`), contributed by
   [@Nanetnounou](https://github.com/Nanetnounou): ×1.9 KV, 1M context on one box — at a
-  speed and quality cost, so it is opt-in. → [fp8 KV cache](HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in)
+  speed cost it was opt-in then; it is the default-profile choice since v0.33.
+  → [fp8 KV cache](HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path)
 - `scripts/smoke-test.sh` now also checks the prefix-cache hit and determinism, and
   measures decode on a real answer instead of `ignore_eos` (which produces meaningless
   numbers with this model). `scripts/download-weights.sh` now forwards `HF_TOKEN`

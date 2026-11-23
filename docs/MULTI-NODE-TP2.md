@@ -258,8 +258,18 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    numbers land here after the first run, gated per §3.7.
 3. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
    offered as a PR and never merged; port it into `src/` as patch 10b).
-4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** for a bigger pool (capetron ran it at TP2; the
-   repo's single-node 1M profiles use it with a quality cost — re-run retrieval checks).
+4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** — **LANDED**: now the `default-tp2.env`
+   default (and `hybrid-tp2.env`), aligning the pair with the single-node
+   `mtp-fast` default. Measured on a live pair 2026-11-20 (nvfp4, eager, native
+   CTX): pool **2,530,697 vs 1,424,967 tokens (+78%)**; greedy probes
+   byte-identical and cold-vs-cached logprob identity PASS at 150k
+   (`scripts/greedy-probe.sh`, `tp2-needle` — retrieval checks done). Costs,
+   both consistent with the single-node record: warm-turn TTFT +16% at
+   long-turn shape (dequant on the read path; parent's −3..−17% prefill),
+   aggregate decode ≈−4%, and attention blocks double to 3,184 tokens, so
+   **sub-3184-token prefixes do not cache** — short-turn workloads lose hit
+   fraction (measured 0.35 vs 0.62 at 700–1700-token turns; 0.73 vs 0.79 at
+   5–9k turns).
 5. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`) — LANDED: now the
    `default-tp2.env` default, verified on a live pair 2026-11-20 (NCCL striped
    1,694/1,616 MiB across the two HCAs per ~10k-token prefill burst; consistent
