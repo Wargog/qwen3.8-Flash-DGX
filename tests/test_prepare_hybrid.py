@@ -63,6 +63,7 @@ shard = root / "dense.safetensors"
 shard.rename(root / "dense.safetensors.bf16.bak")
 shard.write_bytes(b"converted synthetic shard")
 data["weight_map"]["dense.weight_scale_inv"] = "dense.safetensors"
+data["carveout_env"] = os.environ.get("KEEP_SHARED_EXPERT_BF16", "")
 index.write_text(json.dumps(data))
 ''')
         bin_dir = self.root / "bin"
@@ -73,13 +74,17 @@ import os, shlex, subprocess, sys
 args = sys.argv[1:]
 assert args[0] == "run" and args[-2] == "-c", args
 mounts = {}
+env = dict(os.environ)
 for i, arg in enumerate(args):
     if arg == "-v":
         host, container, *_ = args[i + 1].split(":")
         mounts[container] = host
+    if arg == "-e":
+        key, _, value = args[i + 1].partition("=")
+        env[key] = value
 command = args[-1].replace("/hf/", mounts["/hf"] + "/")
 command = command.replace("/tools/", shlex.quote(os.environ["FAKE_TOOLS"] + "/"))
-sys.exit(subprocess.run(["bash", "-c", command]).returncode)
+sys.exit(subprocess.run(["bash", "-c", command], env=env).returncode)
 ''')
         docker.chmod(0o755)
         self.env = {
@@ -139,6 +144,40 @@ sys.exit(subprocess.run(["bash", "-c", command]).returncode)
         self.assertFalse((self.hybrid / ".prepared").exists())
         self.assertEqual((self.source / INDEX).read_bytes(), self.original_index)
         self.assert_prepared()
+
+    # --- TP>1 shared-experts carveout (issue #52 §2) -------------------------------
+
+    def test_tp2_carves_out_shared_experts(self):
+        (self.source / INDEX).write_bytes(self.original_index)
+        result = self.prepare(TP_SIZE="2")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        converted = json.loads((self.hybrid / INDEX).read_text())
+        # docker forwarded -e KEEP_SHARED_EXPERT_BF16=1 into the converter...
+        self.assertEqual(converted["carveout_env"], "1")
+        # ...and the layout records which variant it is.
+        self.assertIn("shared_experts_bf16", (self.hybrid / ".prepared").read_text())
+
+    def test_tp2_refuses_full_layout(self):
+        (self.source / INDEX).write_bytes(self.original_index)
+        full = self.prepare()
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        self.assertEqual(json.loads((self.hybrid / INDEX).read_text())["carveout_env"], "")
+        self.assertEqual((self.hybrid / ".prepared").read_text().strip(), "")
+        refused = self.prepare(TP_SIZE="2")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("rm -rf", refused.stdout)
+        # Refusing must leave the existing layout untouched.
+        self.assertEqual((self.hybrid / "dense.safetensors").read_bytes(),
+                         b"converted synthetic shard")
+
+    def test_tp1_accepts_carved_out_layout(self):
+        (self.source / INDEX).write_bytes(self.original_index)
+        carved = self.prepare(TP_SIZE="2")
+        self.assertEqual(carved.returncode, 0, carved.stdout + carved.stderr)
+        again = self.prepare()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("carveout", again.stdout)
+        self.assertIn("already prepared", again.stdout)
 
 
 if __name__ == "__main__":

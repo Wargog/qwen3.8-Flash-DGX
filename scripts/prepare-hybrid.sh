@@ -19,6 +19,15 @@ set -euo pipefail
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # default since 2026-09-14; works unchanged on RadixArk/Qwen3.8-Flash-Next-NVFP4
 IMAGE="${IMAGE:-qwen38-flash-dgx:v0.33}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
+# TP>1 carveout (issue #52 §2): mlp.shared_expert.* is 640 wide -> 320 per rank, which
+# vLLM's blockwise-fp8 loader rejects (block_n=128). On a TP profile the converter keeps
+# that family bf16 so MODE=hybrid loads at TP=2. `./flash setup` loads the profile and
+# exports TP_SIZE, so a TP_SIZE>1 profile triggers this automatically; running the
+# script directly, opt in with: TP_SIZE=2 scripts/prepare-hybrid.sh
+TP_SIZE="${TP_SIZE:-1}"
+CONVERT_ENV=()
+MARKER=""
+if [ "$TP_SIZE" != 1 ]; then CONVERT_ENV=(-e KEEP_SHARED_EXPERT_BF16=1); MARKER="tp-carveout: shared_experts_bf16 (issue #52)"; fi
 
 REPO_DIR="$HF_CACHE/hub/models--${MODEL//\//--}"
 # Same revision resolution as scripts/serve.sh - the two must agree on the snapshot.
@@ -92,6 +101,20 @@ if [ "$QM" = "compressed-tensors" ]; then
 fi
 
 if [ -f "$DST/.prepared" ]; then
+  # A full-converted layout + TP>1 = the #52 load crash; refuse rather than let the
+  # launcher find out at weight-load time. (The marker records intent; serve-tp2.sh
+  # re-checks the index itself, the ground truth.)
+  if [ "$TP_SIZE" != 1 ] && ! grep -q shared_experts_bf16 "$DST/.prepared"; then
+    echo "!! existing -fp8hybrid layout has the shared experts in fp8 — it will fail to load at TP>1 (#52)."
+    echo "   rebuild with the carveout (recreates only relative symlinks + the 4 fp8 shards):"
+    echo "   rm -rf '$DST'   &&   TP_SIZE='$TP_SIZE' scripts/prepare-hybrid.sh"
+    exit 1
+  fi
+  if [ "$TP_SIZE" = 1 ] && grep -q shared_experts_bf16 "$DST/.prepared"; then
+    echo ">> note: this layout carries the TP carveout (shared experts bf16). Inference: it also serves"
+    echo "   fine at TP=1, just without the shared-expert bandwidth; for the full conversion:"
+    echo "   rm -rf '$DST' && re-run with TP_SIZE=1"
+  fi
   STALE="$(missing_in "$DST")"
   if [ -z "$STALE" ]; then echo ">> already prepared: $DST"; exit 0; fi
   echo ">> already prepared but missing $STALE (prepared from an incomplete download) — repairing from the snapshot"
@@ -109,8 +132,9 @@ done"
 fi
 
 echo ">> preparing $DST (relative symlinks + 4 shards converted to blockwise fp8, ~10 min)"
+[ "$TP_SIZE" != 1 ] && echo ">> TP carveout: mlp.shared_expert.* stays bf16 (issue #52)"
 docker run --rm --name qwen38-fp8convert \
-  -v "$HF_CACHE:/hf" -v "$PWD/tools:/tools:ro" --entrypoint bash "$IMAGE" -c "
+  -v "$HF_CACHE:/hf" -v "$PWD/tools:/tools:ro" "${CONVERT_ENV[@]}" --entrypoint bash "$IMAGE" -c "
 set -euo pipefail
 rm -rf '$DST_IN'
 # cp -a keeps the relative symlinks (../../blobs/<sha>) as symlinks: instant, no copy.
@@ -126,7 +150,7 @@ python3 /tools/fp8_convert.py '$DST_IN' | tee '$DST_IN/fp8_convert.log'
 n=\$(python3 -c \"import json;print(sum(1 for k in json.load(open('$DST_IN/model.safetensors.index.json'))['weight_map'] if k.endswith('weight_scale_inv')))\")
 [ \"\$n\" -gt 0 ] || { echo '!! conversion produced no fp8 tensors'; exit 1; }
 chmod 644 '$DST_IN'/*.safetensors '$DST_IN'/model.safetensors.index.json
-touch '$DST_IN/.prepared'
+printf '%s\n' '$MARKER' > '$DST_IN/.prepared'
 echo \">> done: \$n fp8 side-layer tensors\"
 "
 echo ">> hybrid checkpoint ready. Serve with:  MODE=hybrid scripts/serve.sh"

@@ -2,6 +2,10 @@
 # From https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound (tools/fp8_convert.py, Apache-2.0),
 # by @Saren-Arterius. Included verbatim (minus this header) so scripts/prepare-hybrid.sh is self-contained.
 # Regex TARGETS matches the RadixArk NVFP4 checkpoint tensor names as well (same HF layout).
+# Local deviation (this repo): KEEP_SHARED_EXPERT_BF16=1 carves mlp.shared_expert.* out of the
+# conversion — required for MODE=hybrid at TP>1 (640 wide -> 320/rank vs fp8 block_n=128,
+# blazux/qwen3.8-Flash-DGX#52 §2; scripts/prepare-hybrid.sh sets it when TP_SIZE>1).
+# Everything else stays verbatim.
 """Convert dense bf16 side-layers of the Intel Flash-Next checkpoint to
 blockwise FP8-e4m3 (DeepSeek format: fp8 `weight` + fp32 `weight_scale_inv`,
 block 128x128). In-place: affected shards are rewritten, originals -> .bf16.bak.
@@ -10,6 +14,7 @@ Only converts tensors whose both dims are divisible by 128 (all listed families
 qualify); anything else is left untouched and reported.
 """
 import json
+import os
 import re
 import shutil
 import sys
@@ -21,13 +26,20 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else sys.exit("usage: fp8_convert.py <ch
 BLOCK = 128
 FP8_MAX = 448.0  # e4m3 max normal
 
-TARGETS = re.compile(
-    r"model\.language_model\.layers\.\d+\.("
+SIDELAYERS = (
     r"linear_attn\.(in_proj_qkv|in_proj_z|out_proj)"
     r"|self_attn\.(q_proj|k_proj|v_proj|o_proj)"
-    r"|mlp\.shared_expert\.(gate_proj|up_proj|down_proj)"
-    r")\.weight$"
 )
+# mlp.shared_expert.* is 640 wide: at TP=2 a rank gets 320 columns, which vLLM's
+# blockwise-fp8 loader rejects ("output_partition_size = 320 is not divisible by
+# block_n = 128", issue #52 §2). Left bf16 the layout loads at any TP, costing
+# the shared-expert bandwidth (3 tensors x 48 layers = 144 unconverted; 1692 fp8
+# tensors convert instead of 1836 — the carveout #52 served on a live TP=2 pair).
+if os.environ.get("KEEP_SHARED_EXPERT_BF16") == "1":
+    print("carveout: mlp.shared_expert.* stays bf16 (TP>1, issue #52)")
+else:
+    SIDELAYERS += r"|mlp\.shared_expert\.(gate_proj|up_proj|down_proj)"
+TARGETS = re.compile(r"model\.language_model\.layers\.\d+\.(" + SIDELAYERS + r")\.weight$")
 
 
 def block_quant(w: torch.Tensor):

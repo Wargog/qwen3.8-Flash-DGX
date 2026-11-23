@@ -35,12 +35,12 @@ done < "$PROF_FILE"
 
 TP_SIZE="${TP_SIZE:-2}"; [ "$TP_SIZE" = 2 ] || { echo "!! this launcher knows TP_SIZE=2 only (two Sparks, one GB10 each)"; exit 1; }
 case "${MODE:-nvfp4}" in
-  nvfp4) ;;
-  hybrid|hybrid-mtp)
-    echo "!! MODE=$MODE does not load at TP>1: mlp.shared_expert.* is 640 wide -> 320 per rank,"
-    echo "   not divisible by the fp8 block_n=128 (issue #52). Use MODE=nvfp4, or the carveout"
-    echo "   in docs/MULTI-NODE-TP2.md section 7.1."
+  nvfp4|hybrid) ;;   # hybrid: -fp8hybrid layout validated after snapshot resolution (#52 carveout)
+  hybrid-mtp)
+    echo "!! MODE=hybrid-mtp (the NVFP4 MTP draft-experts graft) is not wired on this TP lane —"
+    echo "   it builds on the hybrid layout but has never run across two nodes. Use MODE=nvfp4 or hybrid."
     exit 1 ;;
+  *) echo "!! MODE must be nvfp4, hybrid or hybrid-mtp"; exit 1 ;;
 esac
 [ "${DRAFT_VOCAB:-1}" = 0 ] || { echo "!! DRAFT_VOCAB crashes at TP>1 (global ids vs the row-sharded lm_head, issue #52) — set DRAFT_VOCAB=0"; exit 1; }
 [ "${PLE_MMAP:-0}" = 0 ] || { echo "!! the PLE mmap hook is untested under TP — set PLE_MMAP=0 (the table fits resident on a pair)"; exit 1; }
@@ -71,7 +71,30 @@ for REF in main master; do
 done
 [ -n "$SNAP" ] || SNAP="$(ls -dt "$REPO_DIR"/snapshots/*/ 2>/dev/null | grep -v -- '-fp8hybrid' | head -1 | sed 's:/$::' || true)"
 [ -n "$SNAP" ] || { echo "!! checkpoint not found under $REPO_DIR — ./flash setup first, then rsync the whole cache to $PEER"; exit 1; }
-SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$(basename "$SNAP")"
+# MODE=hybrid (issue #52 §2): serve the -fp8hybrid sibling layout. It loads at TP=2 only if
+# the shared experts stayed bf16 (640 wide -> 320/rank trips vLLM's blockwise-fp8 loader,
+# block_n=128). The INDEX is the ground truth for that — refuse on what the loader will
+# actually see, not on what .prepared claims. Prepare: ./flash setup hybrid-tp2 (or
+# TP_SIZE=2 scripts/prepare-hybrid.sh), then rsync the whole HF cache to the worker.
+HYBRID_ENV=()
+MODEL_DIR="$SNAP"
+if [ "${MODE:-nvfp4}" = hybrid ]; then
+  MODEL_DIR="${SNAP}-fp8hybrid"
+  [ -f "$MODEL_DIR/.prepared" ] || { echo "!! hybrid checkpoint not prepared — ./flash setup hybrid-tp2,"
+    echo "   or directly: TP_SIZE=2 scripts/prepare-hybrid.sh (one-time, ~10 min, +13 GB)"; exit 1; }
+  [ -e "$MODEL_DIR/config.json" ] || { echo "!! the -fp8hybrid layout has no config.json: prepared from an"
+    echo "   incomplete download (issue #17) — run TP_SIZE=2 scripts/prepare-hybrid.sh again, it repairs it"; exit 1; }
+  IDX="$MODEL_DIR/model.safetensors.index.json"
+  [ -f "$IDX" ] || { echo "!! no model.safetensors.index.json in $MODEL_DIR — re-run TP_SIZE=2 scripts/prepare-hybrid.sh"; exit 1; }
+  if grep -q 'mlp\.shared_expert\.[a-z_]*\.weight_scale_inv' "$IDX"; then
+    echo "!! this -fp8hybrid layout converted the shared experts to fp8 — vLLM will crash at load on TP=2"
+    echo "   (#52). Rebuild with the carveout:"
+    echo "   rm -rf '$MODEL_DIR'   &&   TP_SIZE=2 scripts/prepare-hybrid.sh"
+    exit 1
+  fi
+  HYBRID_ENV=(-e VLLM_FP8_HYBRID=1 -e VLLM_USE_DEEP_GEMM=0)   # exactly serve.sh's hybrid env
+fi
+SNAP_IN="/hf/hub/models--${MODEL//\//--}/snapshots/$(basename "$MODEL_DIR")"
 
 # reasoning_effort aliases (mirror of serve.sh EFFORT_ALIAS=1): the NVIDIA template 400s on
 # high/max/minimal (Claude Code sends high). Rewrite the one effort-resolving line, publish the
@@ -100,8 +123,17 @@ have_image() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
 have_image || { echo "!! $IMAGE not built here — ./flash setup"; exit 1; }
 ssh "$PEER" "docker image inspect $IMAGE >/dev/null 2>&1" \
   || { echo "!! $IMAGE not on $PEER — ship it: docker save $IMAGE | zstd -T0 -3 | ssh $PEER 'zstd -d | docker load'"; exit 1; }
-ssh "$PEER" "test -d '$REPO_DIR/snapshots/$(basename "$SNAP")'" \
-  || { echo "!! snapshot not on $PEER at $REPO_DIR — rsync the whole $HF_CACHE across"; exit 1; }
+PEER_SNAP="$REPO_DIR/snapshots/$(basename "$MODEL_DIR")"
+ssh "$PEER" "test -d '$PEER_SNAP'" \
+  || { echo "!! $(basename "$MODEL_DIR") not on $PEER at $REPO_DIR — rsync the whole $HF_CACHE across"; exit 1; }
+if [ "${MODE:-nvfp4}" = hybrid ]; then
+  # A follower's synced cache does not gain new files retroactively: check the worker's
+  # copy of the layout too, so a stale rsync fails here instead of at rank 1's load.
+  ssh "$PEER" "test -f '$PEER_SNAP/model.safetensors.index.json' \
+    && ! grep -q 'mlp\.shared_expert\.[a-z_]*\.weight_scale_inv' '$PEER_SNAP/model.safetensors.index.json'" \
+    || { echo "!! the -fp8hybrid copy on $PEER is missing its index or still has fp8 shared experts (#52)"
+         echo "   — rank 1 would crash at load. rsync the whole $HF_CACHE across and re-run"; exit 1; }
+fi
 
 # RoCEv2 GID indices are NOT stable: a one-sided reboot or an address
 # add/remove leaves holes in a port's GID table and displaces the RoCE v2 IPv4
@@ -201,6 +233,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
   [ "${YARN:-0}" != 0 ] && vllm_args+=(--hf-overrides "$YARN_OVR")
   [ ${#TPL_MNT[@]} -gt 0 ] && docker_args+=("${TPL_MNT[@]}")
   [ ${#TPL_ARGS[@]} -gt 0 ] && vllm_args+=("${TPL_ARGS[@]}")
+  [ ${#HYBRID_ENV[@]} -gt 0 ] && docker_args+=("${HYBRID_ENV[@]}")
   [ "${PREFIX_CACHE:-1}" = 1 ] && vllm_args+=(--enable-prefix-caching) || vllm_args+=(--no-enable-prefix-caching)
   [ "$rank" != 0 ] && vllm_args+=(--headless)   # without it: "collective_rpc should not be called on follower node"
   if [ -z "$host" ]; then docker "${docker_args[@]}" "$IMAGE" "${vllm_args[@]}" ${EXTRA:-}

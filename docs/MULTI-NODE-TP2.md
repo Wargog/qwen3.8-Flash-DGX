@@ -31,7 +31,7 @@ gain at 4+ clients is small (~+9% in #52). You buy latency and context, not thro
 | # | Symptom | Cause | Fix |
 |---|---------|-------|-----|
 | 1 | NCCL "works" but prefill is *slower than one node*; `NCCL_DEBUG=INFO` shows `via NET/Socket` | The playbook/`run_cluster.sh` path doesn't pass the IB devices into the container, so NCCL silently falls back to TCP ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | `--device=/dev/infiniband --ulimit memlock=-1:-1 --cap-add=IPC_LOCK` plus the `NCCL_IB_*` env in §4; verify every channel says `NET/IB` |
-| 2 | `ValueError: Weight output_partition_size = 320 is not divisible by weight block_n = 128` at load | `MODE=hybrid`: `mlp.shared_expert.*` is 640 wide → 320/rank, not divisible by the fp8 block size ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | Start with `MODE=nvfp4` (works). For hybrid, see §7.1 (exclude shared experts from the fp8 conversion) |
+| 2 | `ValueError: Weight output_partition_size = 320 is not divisible by weight block_n = 128` at load | `MODE=hybrid`: `mlp.shared_expert.*` is 640 wide → 320/rank, not divisible by the fp8 block size ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | Start with `MODE=nvfp4` (works). For hybrid: `./flash setup hybrid-tp2` prepares the carveout layout (shared experts stay bf16, per #52) and `serve-tp2.sh` gates on it — see §7.2 |
 | 3 | `CUBLAS_STATUS_INTERNAL_ERROR` in `mtp.py:_dv_compute_logits` at first decode | `DRAFT_VOCAB=1` (`mtp-standard`, `default`) does `w.index_select(0, ids)` with global ids against a TP-row-sharded `lm_head` ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | `DRAFT_VOCAB=0` (`mtp-fast` already is). #52 includes a shard-aware fix if you want the +20% decode back |
 | 4 | Garbled/incorrect output only on TP (inference from #52's setup notes) | The PLE-mmap hook (`VLLM_PLE_MMAP=1`, the single-Spark trick) gathers **global** rows on every rank; TP semantics for the resident path differ | Run with `VLLM_PLE_MMAP=0`. No mmap needed: each rank only holds ~1/2 of the non-table weights, so the 47.7 GiB n-gram table fits resident (drop caches first, §3.4) |
 | 5 | After weight load: hang at first all-reduce / KV profiling, GPU pinned ~100%, no traceback | Cross-node all-reduce failure class on early dual-Spark stacks (vLLM 0.10–0.17 era, driver 580.126) — [forum thread](https://forums.developer.nvidia.com/t/nccl-all-reduce-deadlock-on-dual-dgx-spark-after-successful-channel-establishment-affects-both-vllm-and-trt-llm/366127); the reporter there got it working only after moving to the current stack with the `mp` executor (no Ray). #52 confirms the same class is gone on driver 580.178.04 / vLLM ≥ 0.31 | Update DGX OS/driver; use the `mp` backend as here. If a hang persists: `NCCL_DEBUG=INFO` and confirm `NET/IB` before blaming vLLM |
@@ -245,12 +245,17 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    draft-model `max_model_len`). **Never run on TP by anyone** (#52/x00byte/capetron
    all ran native 262k): after first boot, gate on retrieval at ~90% of CTX +
    `scripts/greedy-probe.sh` + a long-context quality spot-check before trusting output.
-2. **Hybrid checkpoint on TP** (the +20% decode): run `prepare-hybrid.sh` with the
-   shared experts excluded, per #52 — edit a copy of `tools/fp8_convert.py` `TARGETS`
-   to drop the `mlp.shared_expert.*` line (they stay bf16; 1692 tensors convert
-   instead of 1836), then serve the `-fp8hybrid` layout with `MODE=hybrid` and
-   `VLLM_FP8_HYBRID=1 -e VLLM_USE_DEEP_GEMM=0`. (Inference: the repo's hybrid hook
-   reads scales per tensor, so leaving one family unconverted only costs bandwidth.)
+2. **Hybrid checkpoint on TP** (the +20% decode): **implemented** —
+   `profiles/hybrid-tp2.env` (`MODE=hybrid`, `MTP=3` to match the repo's hybrid
+   default, `default.env` → `mtp-fast.env`). `./flash setup hybrid-tp2` converts
+   with `mlp.shared_expert.*` left bf16 (the #52 carveout: 1692 tensors instead
+   of 1836 — converted, they are 320/rank at TP=2 vs block_n=128 and the loader
+   refuses, §1 row 2); `serve-tp2.sh` gates on BOTH nodes' index files proving
+   the carveout (stale-rsync proof) and passes `VLLM_FP8_HYBRID=1` +
+   `VLLM_USE_DEEP_GEMM=0` to both ranks. rsync the whole HF cache after
+   preparing. The load+serve at TP=2 is measured in #52 (MTP=2, v0.31); hybrid +
+   MTP=3 on this repo's stack has NOT yet run on a live pair — performance
+   numbers land here after the first run, gated per §3.7.
 3. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
    offered as a PR and never merged; port it into `src/` as patch 10b).
 4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** for a bigger pool (capetron ran it at TP2; the
