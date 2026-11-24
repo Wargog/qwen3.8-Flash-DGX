@@ -3,8 +3,9 @@
 #
 # Primarily written by an AI agent (from issue #52, the x00byte and capetron
 # dual-Spark recipes, MiaAI-Lab dual-Spark #73, the NVIDIA playbooks and the
-# NCCL env docs) and NOT validated on a live
-# pair; docs/MULTI-NODE-TP2.md carries the failure table and acceptance
+# NCCL env docs) and validated end-to-end on a live pair since
+# (launch, §3.7 gates, benches — docs/MULTI-NODE-TP2.md §4/§7); docs/MULTI-NODE-TP2.md
+# carries the failure table and acceptance
 # checks. flash/serve.sh stay single-node on purpose: a bridged, port-mapped
 # container cannot join a multi-node mp group (cross-node NCCL and the torch
 # rendezvous need the hosts' real fabric IPs, so the containers use
@@ -45,7 +46,7 @@ esac
 [ "${DRAFT_VOCAB:-1}" = 0 ] || { echo "!! DRAFT_VOCAB crashes at TP>1 (global ids vs the row-sharded lm_head, issue #52) — set DRAFT_VOCAB=0"; exit 1; }
 [ "${PLE_MMAP:-0}" = 0 ] || { echo "!! the PLE mmap hook is untested under TP — set PLE_MMAP=0 (the table fits resident on a pair)"; exit 1; }
 [ "${CTX:-262144}" -le 262144 ] || [ "${YARN:-0}" != 0 ] || { echo "!! CTX=${CTX:-262144} exceeds native 262144 without YaRN — set YARN=1 or lower CTX"; exit 1; }
-[ "${YARN:-0}" = 0 ] || echo "!! note: YaRN is wired here (--hf-overrides factor 4 + draft max_model_len, same recipe as serve.sh) but has never RUN on TP — before trusting it, gate on retrieval at CTX + scripts/greedy-probe.sh"
+[ "${YARN:-0}" = 0 ] || echo "!! note: YaRN on TP — retrieval and greedy text validated to CTX 500k; first-token logprob identity holds fresh to ~50% of CTX and FAILS near CTX even with SPLIT_PREFILL=1 (docs/MULTI-NODE-TP2.md §7.1)"
 ROCE_SUBNET="${ROCE_SUBNET:?ROCE_SUBNET=fabric subnet CIDR, the one shared by both RoCE interfaces}"
 if [ -n "${NCCL_IB_GID_INDEX:-}" ]; then
   echo "!! note: NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX is IGNORED by this lane."
@@ -74,13 +75,13 @@ done
 # MODE=hybrid (issue #52 §2): serve the -fp8hybrid sibling layout. It loads at TP=2 only if
 # the shared experts stayed bf16 (640 wide -> 320/rank trips vLLM's blockwise-fp8 loader,
 # block_n=128). The INDEX is the ground truth for that — refuse on what the loader will
-# actually see, not on what .prepared claims. Prepare: ./flash setup hybrid-tp2 (or
+# actually see, not on what .prepared claims. Prepare: ./flash setup default-tp2 (or
 # TP_SIZE=2 scripts/prepare-hybrid.sh), then rsync the whole HF cache to the worker.
 HYBRID_ENV=()
 MODEL_DIR="$SNAP"
 if [ "${MODE:-nvfp4}" = hybrid ]; then
   MODEL_DIR="${SNAP}-fp8hybrid"
-  [ -f "$MODEL_DIR/.prepared" ] || { echo "!! hybrid checkpoint not prepared — ./flash setup hybrid-tp2,"
+  [ -f "$MODEL_DIR/.prepared" ] || { echo "!! hybrid checkpoint not prepared — ./flash setup default-tp2,"
     echo "   or directly: TP_SIZE=2 scripts/prepare-hybrid.sh (one-time, ~10 min, +13 GB)"; exit 1; }
   [ -e "$MODEL_DIR/config.json" ] || { echo "!! the -fp8hybrid layout has no config.json: prepared from an"
     echo "   incomplete download (issue #17) — run TP_SIZE=2 scripts/prepare-hybrid.sh again, it repairs it"; exit 1; }

@@ -6,11 +6,10 @@
 > [x00byte dual-Spark recipe](https://github.com/x00byte/Qwen3.8-Flash-Dual-Spark-Recipe),
 > the [capetron GB10 cluster guide](https://capetron.github.io/gb10-cluster-guide/serving-models/),
 > the NVIDIA multi-node playbooks and vLLM's own docs. The launcher's command
-> assembly is mock-verified (`bash -n` + stubbed `docker`/`ssh` dry-runs), but
-> **no live two-Spark run has validated this checkout**, and it is deliberately
-> outside `flash serve` and the repo's single-node validation suite. Treat every
-> run on the pair as a validation session: run §3.7 end to end before trusting
-> outputs.
+> mock-verified before shipping (`bash -n` + stubbed `docker`/`ssh` dry-runs) and
+> **since validated end-to-end on a live pair** (launches, §3.7 gates, benches —
+> §4/§7). It remains deliberately outside `flash serve` and the repo's single-node
+> validation suite; re-run §3.7 after any stack change before trusting outputs.
 
 This recipe runs `blazux/qwen3.8-Flash-DGX` as a two-node **tensor-parallel (TP=2)**
 deployment over the ConnectX-7 / RoCE link. It is *not* a first-class repo mode —
@@ -31,7 +30,7 @@ gain at 4+ clients is small (~+9% in #52). You buy latency and context, not thro
 | # | Symptom | Cause | Fix |
 |---|---------|-------|-----|
 | 1 | NCCL "works" but prefill is *slower than one node*; `NCCL_DEBUG=INFO` shows `via NET/Socket` | The playbook/`run_cluster.sh` path doesn't pass the IB devices into the container, so NCCL silently falls back to TCP ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | `--device=/dev/infiniband --ulimit memlock=-1:-1 --cap-add=IPC_LOCK` plus the `NCCL_IB_*` env in §4; verify every channel says `NET/IB` |
-| 2 | `ValueError: Weight output_partition_size = 320 is not divisible by weight block_n = 128` at load | `MODE=hybrid`: `mlp.shared_expert.*` is 640 wide → 320/rank, not divisible by the fp8 block size ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | Default since 2026-11-24: run `./flash setup hybrid-tp2` first — it prepares the carveout layout (shared experts stay bf16, per #52) and `serve-tp2.sh` gates on it — see §7.2. `MODE=nvfp4` remains the published-checkpoint fallback. |
+| 2 | `ValueError: Weight output_partition_size = 320 is not divisible by weight block_n = 128` at load | `MODE=hybrid`: `mlp.shared_expert.*` is 640 wide → 320/rank, not divisible by the fp8 block size ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | Default since 2026-11-24: run `./flash setup default-tp2` first — it prepares the carveout layout (shared experts stay bf16, per #52) and `serve-tp2.sh` gates on it — see §7.2. `MODE=nvfp4` remains the published-checkpoint fallback. |
 | 3 | `CUBLAS_STATUS_INTERNAL_ERROR` in `mtp.py:_dv_compute_logits` at first decode | `DRAFT_VOCAB=1` (`mtp-standard`, `default`) does `w.index_select(0, ids)` with global ids against a TP-row-sharded `lm_head` ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | `DRAFT_VOCAB=0` (`mtp-fast` already is). #52 includes a shard-aware fix if you want the +20% decode back |
 | 4 | Garbled/incorrect output only on TP (inference from #52's setup notes) | The PLE-mmap hook (`VLLM_PLE_MMAP=1`, the single-Spark trick) gathers **global** rows on every rank; TP semantics for the resident path differ | Run with `VLLM_PLE_MMAP=0`. No mmap needed: each rank only holds ~1/2 of the non-table weights, so the 47.7 GiB n-gram table fits resident (drop caches first, §3.4) |
 | 5 | After weight load: hang at first all-reduce / KV profiling, GPU pinned ~100%, no traceback | Cross-node all-reduce failure class on early dual-Spark stacks (vLLM 0.10–0.17 era, driver 580.126) — [forum thread](https://forums.developer.nvidia.com/t/nccl-all-reduce-deadlock-on-dual-dgx-spark-after-successful-channel-establishment-affects-both-vllm-and-trt-llm/366127); the reporter there got it working only after moving to the current stack with the `mp` executor (no Ray). #52 confirms the same class is gone on driver 580.178.04 / vLLM ≥ 0.31 | Update DGX OS/driver; use the `mp` backend as here. If a hang persists: `NCCL_DEBUG=INFO` and confirm `NET/IB` before blaming vLLM |
@@ -66,7 +65,8 @@ stage-sliceable in this vLLM). Two Sparks TP=2 is therefore the natural pairing.
 - 2× DGX Spark (GB10, 128 GB each — same size on both), DGX OS up to date, driver ≥ 580.178.
 - One QSFP 200G DAC (or two, both rails) between the boxes. The repo recipe was
   validated with RoCE; over plain TCP, two nodes were *slower at prefill than one* (#52).
-- ~140 GB free NVMe per box (weights) + 13 GB if you later prepare hybrid.
+- ~140 GB free NVMe per box (weights) + 13 GB for the hybrid layout the default
+  profile boots (§3.3/§3.5).
 - Passwordless SSH head → worker; `docker` usable by your user on both.
 - A checkout of this repo on **both** nodes, same commit.
 
@@ -116,6 +116,7 @@ also works, but takes ~10× longer over a slow uplink.)
 
 ```shell
 ./flash setup                    # downloads to ~/.cache/huggingface on the head
+./flash setup default-tp2        # also prepares the -fp8hybrid layout (the #52 carveout) the default profile boots
 rsync -a --info=progress2 ~/.cache/huggingface/ worker:~/.cache/huggingface/
 # rsync preserves the relative snapshot->blob symlinks; verify on the worker:
 find ~/.cache/huggingface/hub -lname '*blobs*' -xtype l   # must print nothing
@@ -134,18 +135,25 @@ docker ps                                    # no other GPU containers
 ### 3.5 The profile — `profiles/default-tp2.env`
 
 Shipped in this checkout (EXPERIMENTAL; primarily AI-authored — see the banner at
-the top; it is `serve-tp2.sh`'s default profile). `./flash doctor default-tp2`
-cross-checks it against the §1 failure table; edit
+the top; it is `serve-tp2.sh`'s default profile). The file is deliberately bare
+KEY=VALUE — one `# desc:` line for `flash profiles` plus the EDIT-here fabric
+block — because the rationale for every knob lives in this document (§1's failure
+table and §7's status notes are its comment block). `./flash doctor default-tp2`
+cross-checks it against the §1 table; edit
 only the fabric block at the end (`MASTER_ADDR`, `PEER`,
 `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`,
 `ROCE_SUBNET`) to match §3.1 — there is deliberately no `NCCL_IB_GID_INDEX`:
 pinned indices break on one-sided reboots (§1 #13), so the RoCEv2 GID is resolved
 by address range instead. The settings that matter and
-why: `MODE=hybrid` (now the default, §7.2 — after `./flash setup hybrid-tp2`
-has built the carveout layout on BOTH boxes, §1 #2; `MODE=nvfp4` reverts),
-`DRAFT_VOCAB=0` (§1 #3), `PLE_MMAP=0` (§1 #4),
-`CTX=262144` native by default (YaRN wired, first-of-kind on TP - see 7.1), `BATCH_TOKENS=8192` (larger measured
-worse, #52), `EAGER=1` for the first bring-up (§1 #8), `GPU_MEM=0.80`
+why: `MODE=hybrid` (§7.2 — prerequisite: `./flash setup default-tp2` once on the
+head, then rsync the whole cache across, §3.3; `MODE=nvfp4` reverts to the
+published checkpoint),
+`CTX=500000` + `YARN=1` (YaRN 500k is the default since 2026-11-24 — validated
+with a near-CTX logprob caveat, §7.1; `CTX=262144` + `YARN=0` reverts to native),
+`KV_DTYPE=fp8_e4m3` (§7.4: +78% pool; sub-3,184-token prefixes do not cache),
+`DRAFT_VOCAB=0` (§1 #3), `PLE_MMAP=0` (§1 #4), `BATCH_TOKENS=8192` (larger measured
+worse, #52), `EAGER=1` (§1 #8; the graphs arm FAILED determinism gates on this
+stack — §7.6), `SPLIT_PREFILL=1` (§7.7), `GPU_MEM=0.80`
 (≥0.85 leaves a 1–4% MemAvailable floor on the unified pool).
 
 ### 3.6 The launcher — `scripts/serve-tp2.sh`
@@ -216,6 +224,11 @@ the eager columns above. The §3.7 first-token-logprob identity check diverged
 cold-vs-cached on that run; relaunching with `SPLIT_PREFILL=1` (later the same day)
 passed every gate, including bit-identical logprobs across a prefix hit — see §7.7.
 
+Default-arm record (2026-11-24 — hybrid + fp8 KV + YaRN CTX=500000, eager, both
+rails; the current `default-tp2`): KV pool **2,917,701** tokens (5.84×
+concurrency at 500k), cold prefill 3,277–3,532 tok/s on serial 60k–470k prompts,
+cached replays 2.2–3.5 s.
+
 ## 5. Day-2 operations
 
 - **Restart:** `scripts/serve-tp2.sh` recreates both containers; a stopped pair can't
@@ -234,23 +247,40 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
 ## 6. What you should NOT try (measured failures)
 
 - `MODE=hybrid` unchanged at TP>1 (issue table #2), `DRAFT_VOCAB=1` unchanged (#3),
-  YaRN >262k without the section 7.1 gates (wired now, but never run on TP), `BATCH_TOKENS=32768` (#52: worse both metrics),
+  YaRN for logprob-sensitive consumers above ~50% of CTX (identity gates — see 7.1; retrieval and text are clean to 470k), `BATCH_TOKENS=32768` (#52: worse both metrics),
   TCP-only transport (#52: slower than one node), TP4 without `--enable-expert-parallel`,
   any PP split of this model.
 
-## 7. Optional upgrades, in order of payoff
+## 7. Upgrades — status log (several have landed; the rest in order of payoff)
 
-1. **YaRN context scaling (`YARN=1`, `CTX=450000`–`500000`)** — the highest-reward
-   item: the pair's 1.4–1.9M KV pool comfortably carries 500k single-stream or
-   several long clients that one Spark can't serve at all. `serve-tp2.sh` wires the
-   full single-node recipe (`--hf-overrides` factor 4, `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`,
-   draft-model `max_model_len`). **Never run on TP by anyone** (#52/x00byte/capetron
-   all ran native 262k): after first boot, gate on retrieval at ~90% of CTX +
-   `scripts/greedy-probe.sh` + a long-context quality spot-check before trusting output.
-2. **Hybrid checkpoint on TP** (the +20% decode): **implemented** —
-   `profiles/hybrid-tp2.env` (`MODE=hybrid`, `MTP=3` to match the repo's hybrid
-   default, `default.env` → `mtp-fast.env`); since 2026-11-24 this recipe is
-   also what the `default-tp2` profile boots. `./flash setup hybrid-tp2` converts
+1. **YaRN context scaling (`YARN=1`, `CTX=500000`) — LANDED as the `default-tp2`
+   default (2026-11-24)**: the pair's fp8-KV pool (2,917,701 tokens, 5.84×
+   concurrency) comfortably carries 500k single-stream or several long clients
+   that one Spark can't serve at all, and `serve-tp2.sh` wires the full
+   single-node recipe (`--hf-overrides` factor 4, `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`,
+   draft-model `max_model_len`). Measured on TP — retrieval and throughput
+   **validated**, identity **caveated** — first runs 2026-11-20 (nvfp4+bf16 arm)
+   and the clean rerun 2026-11-24 (hybrid+fp8 default arm) with
+   `scripts/tp2-needle.py`, strictly serial (§7.2's concurrency rule):
+   - Retrieval: needles at 10–90% depth FOUND at every size tested (60k–470k
+     prompt tokens); greedy **text** byte-identical cold-vs-cached through 470k.
+   - Prefill not degraded by YaRN scaling: 3,277–3,532 tok/s serial; a 470k
+     prompt replays from cache in 3.3 s.
+   - **Caveat (logprob consumers):** cold-vs-cached first-token logprob identity
+     holds fresh to ~50% of CTX (PASS at 60k/150k/250k) but **FAILS at ~94% of
+     CTX** (470k; reproduced on two independent engines) — and it fails with a
+     **FULL intact cache reload** (hit_frac 0.9981), so this is the reload
+     compute path diverging, not eviction: `SPLIT_PREFILL` does not cover this
+     cell (§7.7). Greedy text and argmax answers are unaffected at any shape,
+     and a failing near-CTX prompt does **not** poison reloads of other
+     sequences on a quiet engine (60k passed immediately after the 470k).
+   - Mechanism open (inference): prefix-cache counters cover attention blocks
+     only, so the mamba-state side of the near-CTX reload is the remaining
+     suspect. Revert: `CTX=262144` + `YARN=0` (native; identity clean to 150k).
+2. **Hybrid checkpoint on TP** (the +20% decode): **LANDED as the default** —
+   `MODE=hybrid` + `MTP=3` (the repo's hybrid default, `default.env` →
+   `mtp-fast.env`) is what `default-tp2` boots; the separate `hybrid-tp2`
+   profile was folded into it — one profile per lane. `./flash setup default-tp2` converts
    with `mlp.shared_expert.*` left bf16 (the #52 carveout: 1692 tensors instead
    of 1836 — converted, they are 320/rank at TP=2 vs block_n=128 and the loader
    refuses, §1 row 2); `serve-tp2.sh` gates on BOTH nodes' index files proving
@@ -293,8 +323,8 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    argmax/answer quality is unaffected at any shape.
 3. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
    offered as a PR and never merged; port it into `src/` as patch 10b).
-4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** — **LANDED**: now the `default-tp2.env`
-   default (and `hybrid-tp2.env`), aligning the pair with the single-node
+4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** — **LANDED**: now the `default-tp2`
+   default, aligning the pair with the single-node
    `mtp-fast` default. Measured on a live pair 2026-11-20 (nvfp4, eager, native
    CTX): pool **2,530,697 vs 1,424,967 tokens (+78%)**; greedy probes
    byte-identical and cold-vs-cached logprob identity PASS at 150k
@@ -320,8 +350,13 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    words; the live pair's kernel exposes them as 64-bit). `/sys/class/net`
    statistics do NOT see GPU-direct RDMA traffic and will wrongly show idle
    rails.
-6. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
-   TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
+6. **Piecewise CUDA graphs** (`EAGER=0`) — DECIDED: stays eager. #52 ran them at
+   TP2 on v0.31, but on this stack a graphs arm FAILED greedy text-identity
+   (two independent cudagraph determinism bugs: the deterministic top-k kernel
+   under replay, and an MTP-draft race — clean 3/3 only with the draft dropped
+   via `MTP=0`, commit 2773d9c; upstream reports drafted from the 2026-11-24
+   A/B records). `EAGER=0` remains wired for experiments; any hang at capture
+   is itself a verdict — revert to eager, see issue table #8.
 7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): wired into
    `serve-tp2.sh` (`-e VLLM_DGX_SPLIT_PREFILL`, the same knob the single-node
    `prefix-cache-safe` profile uses; unlike `serve.sh` the TP launcher doesn't
@@ -331,7 +366,13 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    identical, so it was scoring-path drift — and passed bit-identical, with the
    prefix-cache hit still working, after relaunching with `SPLIT_PREFILL=1`.
    That is why the `default-tp2` profile defaults it to 1: the #73 class is not
-   TP-specific, and neither is the fix.
+   TP-specific, and neither is the fix. **Scope of the fix (measured 2026-11-20/24):**
+   on native CTX the fix is load-bearing AND sufficient at 150k (SP=1 PASS /
+   SP=0 FAIL, Δtop1≈0.34 — the class is real on native too). It does **not**
+   cover the near-CTX YaRN cell: 470k@CTX500k fails cold-vs-cached with
+   `SPLIT_PREFILL=1` on a FULL reload — §7.1. The early ≤10.7k validations
+   proved the checkpoint-boundary path only; that was the test ceiling, not the
+   fix's boundary.
 
 ## 8. Sources
 

@@ -269,7 +269,7 @@ cmd_doctor() {
       else fail "the -fp8hybrid layout converted the shared experts to fp8 — it fails to load at TP>1 (#52): delete it and re-run ./flash setup $profile"; fi
     fi
     if [ "${DRAFT_VOCAB:-1}" != 0 ]; then fail "DRAFT_VOCAB crashes at TP>1 (global ids vs the row-sharded lm_head, issue #52) — set DRAFT_VOCAB=0"; fi
-    if [ "${YARN:-0}" != 0 ]; then warn "YaRN beyond native CTX is unverified on TP (#52, x00byte, capetron all ran native 262k)"; fi
+    if [ "${YARN:-0}" != 0 ]; then info "YaRN on TP: retrieval/greedy text validated to 500k CTX; logprob identity caveat above ~50% of CTX (docs/MULTI-NODE-TP2.md §7.1)"; fi
   fi
   [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ] && ok "profile looks fine"
 
