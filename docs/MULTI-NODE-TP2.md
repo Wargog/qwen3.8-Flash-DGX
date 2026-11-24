@@ -261,7 +261,33 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    the checkpoint boundary; HumanEval ~98% and run-consistent (one sample
    always hits the script's token cap = think-overflow truncation, a
    false-fail of the harness, not a quality signal — #52's missing quality
-   eval is hereby covered). Performance numbers pending, same protocol as §4.
+   eval is hereby covered).
+   **Perf, same protocol as §4** (fresh boot, no pre-traffic, seed 3100,
+   600 s, client concurrency = SEQS): decode median **47–48 tok/s** in every
+   cell — §4's eager nvfp4 was 31.3 end-to-end, so ~+40%, and within reach of
+   #52's 50 tok/s graphs+MTP2 while running eager; implied cold prefill
+   ~3,900 tok/s (derived as prompt_tokens/TTFT, so it includes request
+   overhead; §4 was 2,963) flat across all 16 cycles; cached-prefill TTFT
+   0.43–0.50 s (§4 rerun: 0.49 s); 4-way aggregate 129.7 tok/s; determinism
+   31/31. The prefix-cache probe had been structurally broken on TP2 until
+   e5b692d (serve-tp2.sh never passed serve.sh's
+   `--enable-prompt-tokens-details`, so the probe died on a null usage field)
+   — first green run 2026-11-24: all 7 serial lengths PASS with exact
+   block-boundary cached counts.
+   **New caveat, concurrency:** under co-scheduling (conc ≥ 2) the first-token
+   LOGPROBS of cold-vs-fresh requests — both fully uncached — drift, while
+   greedy TEXT stays identical everywhere (31/31 under load). The delta scales
+   with the number of chunk boundaries a request crosses: 10k prompt 0.77 at
+   conc=8, 0.23 at conc=2; 4k prompt 0.14; a single-chunk request (1k prompt
+   at conc=2 — prefill finishes in one step) is EXACTLY 0.0 under the same
+   load. Measured mechanism: chunked-prefill KV round-trip — the per-step
+   budget (8192) is shared across in-flight requests, so chunk boundaries move
+   with batch composition, and later chunks attend to the pool's stored copy
+   of earlier chunks. fp8-e4m3 as the error CARRIER is inference, not yet
+   measured — upgrade it with one restart: `KV_DTYPE=auto` + rerun the
+   concurrency probe. Operational rule: §3.7-style logprob-identity
+   comparisons need serial scheduling (conc=1) or single-chunk prompts;
+   argmax/answer quality is unaffected at any shape.
 3. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
    offered as a PR and never merged; port it into `src/` as patch 10b).
 4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** — **LANDED**: now the `default-tp2.env`
@@ -275,17 +301,22 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    aggregate decode ≈−4%, and attention blocks double to 3,184 tokens, so
    **sub-3184-token prefixes do not cache** — short-turn workloads lose hit
    fraction (measured 0.35 vs 0.62 at 700–1700-token turns; 0.73 vs 0.79 at
-   5–9k turns).
+   5–9k turns). Scope note: those identity gates were SERIAL runs; the
+   2026-11-24 concurrency probe (item 2's caveat) shows the stored-KV
+   round-trip does perturb reported logprobs once chunk boundaries move —
+   whether fp8 is the carrier is the pending `KV_DTYPE=auto` A/B.
 5. **Both rails** (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`) — LANDED: now the
    `default-tp2.env` default, verified on a live pair 2026-11-20 (NCCL striped
    1,694/1,616 MiB across the two HCAs per ~10k-token prefill burst; consistent
    with #52's prefill +10–19%, decode neutral). With Sync-preset pairs the two
    QSFP links often sit in different /24s — set `ROCE_SUBNET` to a supernet
    covering both (the GID preflight checks every HCA against that one range).
-   Check a live instance by diffing
+   Check a live instance around a cold prefill with `scripts/rail-check.py` —
+   it takes width-aware deltas of
    `/sys/class/infiniband/<dev>/ports/1/counters/port_{xmit,rcv}_data` (4-byte
-   words, 32-bit wrap) around a cold prefill — `/sys/class/net` statistics do
-   NOT see GPU-direct RDMA traffic and will wrongly show idle rails.
+   words; the live pair's kernel exposes them as 64-bit). `/sys/class/net`
+   statistics do NOT see GPU-direct RDMA traffic and will wrongly show idle
+   rails.
 6. **Piecewise CUDA graphs** (`EAGER=0`) once eager runs are stable — #52 ran them at
    TP2 on v0.31. Any hang at capture: revert to eager, see issue table #8.
 7. **Prefix-cache checkpoint workaround** (`SPLIT_PREFILL=1`, patch 24): wired into
