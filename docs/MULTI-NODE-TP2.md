@@ -31,7 +31,7 @@ gain at 4+ clients is small (~+9% in #52). You buy latency and context, not thro
 | # | Symptom | Cause | Fix |
 |---|---------|-------|-----|
 | 1 | NCCL "works" but prefill is *slower than one node*; `NCCL_DEBUG=INFO` shows `via NET/Socket` | The playbook/`run_cluster.sh` path doesn't pass the IB devices into the container, so NCCL silently falls back to TCP ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | `--device=/dev/infiniband --ulimit memlock=-1:-1 --cap-add=IPC_LOCK` plus the `NCCL_IB_*` env in §4; verify every channel says `NET/IB` |
-| 2 | `ValueError: Weight output_partition_size = 320 is not divisible by weight block_n = 128` at load | `MODE=hybrid`: `mlp.shared_expert.*` is 640 wide → 320/rank, not divisible by the fp8 block size ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | Start with `MODE=nvfp4` (works). For hybrid: `./flash setup hybrid-tp2` prepares the carveout layout (shared experts stay bf16, per #52) and `serve-tp2.sh` gates on it — see §7.2 |
+| 2 | `ValueError: Weight output_partition_size = 320 is not divisible by weight block_n = 128` at load | `MODE=hybrid`: `mlp.shared_expert.*` is 640 wide → 320/rank, not divisible by the fp8 block size ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | Default since 2026-11-24: run `./flash setup hybrid-tp2` first — it prepares the carveout layout (shared experts stay bf16, per #52) and `serve-tp2.sh` gates on it — see §7.2. `MODE=nvfp4` remains the published-checkpoint fallback. |
 | 3 | `CUBLAS_STATUS_INTERNAL_ERROR` in `mtp.py:_dv_compute_logits` at first decode | `DRAFT_VOCAB=1` (`mtp-standard`, `default`) does `w.index_select(0, ids)` with global ids against a TP-row-sharded `lm_head` ([#52](https://github.com/blazux/qwen3.8-Flash-DGX/issues/52)) | `DRAFT_VOCAB=0` (`mtp-fast` already is). #52 includes a shard-aware fix if you want the +20% decode back |
 | 4 | Garbled/incorrect output only on TP (inference from #52's setup notes) | The PLE-mmap hook (`VLLM_PLE_MMAP=1`, the single-Spark trick) gathers **global** rows on every rank; TP semantics for the resident path differ | Run with `VLLM_PLE_MMAP=0`. No mmap needed: each rank only holds ~1/2 of the non-table weights, so the 47.7 GiB n-gram table fits resident (drop caches first, §3.4) |
 | 5 | After weight load: hang at first all-reduce / KV profiling, GPU pinned ~100%, no traceback | Cross-node all-reduce failure class on early dual-Spark stacks (vLLM 0.10–0.17 era, driver 580.126) — [forum thread](https://forums.developer.nvidia.com/t/nccl-all-reduce-deadlock-on-dual-dgx-spark-after-successful-channel-establishment-affects-both-vllm-and-trt-llm/366127); the reporter there got it working only after moving to the current stack with the `mp` executor (no Ray). #52 confirms the same class is gone on driver 580.178.04 / vLLM ≥ 0.31 | Update DGX OS/driver; use the `mp` backend as here. If a hang persists: `NCCL_DEBUG=INFO` and confirm `NET/IB` before blaming vLLM |
@@ -141,7 +141,9 @@ only the fabric block at the end (`MASTER_ADDR`, `PEER`,
 `ROCE_SUBNET`) to match §3.1 — there is deliberately no `NCCL_IB_GID_INDEX`:
 pinned indices break on one-sided reboots (§1 #13), so the RoCEv2 GID is resolved
 by address range instead. The settings that matter and
-why: `MODE=nvfp4` (§1 #2), `DRAFT_VOCAB=0` (§1 #3), `PLE_MMAP=0` (§1 #4),
+why: `MODE=hybrid` (now the default, §7.2 — after `./flash setup hybrid-tp2`
+has built the carveout layout on BOTH boxes, §1 #2; `MODE=nvfp4` reverts),
+`DRAFT_VOCAB=0` (§1 #3), `PLE_MMAP=0` (§1 #4),
 `CTX=262144` native by default (YaRN wired, first-of-kind on TP - see 7.1), `BATCH_TOKENS=8192` (larger measured
 worse, #52), `EAGER=1` for the first bring-up (§1 #8), `GPU_MEM=0.80`
 (≥0.85 leaves a 1–4% MemAvailable floor on the unified pool).
@@ -247,7 +249,8 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    `scripts/greedy-probe.sh` + a long-context quality spot-check before trusting output.
 2. **Hybrid checkpoint on TP** (the +20% decode): **implemented** —
    `profiles/hybrid-tp2.env` (`MODE=hybrid`, `MTP=3` to match the repo's hybrid
-   default, `default.env` → `mtp-fast.env`). `./flash setup hybrid-tp2` converts
+   default, `default.env` → `mtp-fast.env`); since 2026-11-24 this recipe is
+   also what the `default-tp2` profile boots. `./flash setup hybrid-tp2` converts
    with `mlp.shared_expert.*` left bf16 (the #52 carveout: 1692 tensors instead
    of 1836 — converted, they are 320/rank at TP=2 vs block_n=128 and the loader
    refuses, §1 row 2); `serve-tp2.sh` gates on BOTH nodes' index files proving
