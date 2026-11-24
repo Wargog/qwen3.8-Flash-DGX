@@ -33,7 +33,7 @@ while True:
     elif quiet_since is None:
         quiet_since = time.monotonic()
     prev = cur
-    if saw_traffic and time.monotonic() - quiet_since >= IDLE_S:
+    if saw_traffic and quiet_since is not None and time.monotonic() - quiet_since >= IDLE_S:
         break
     if time.monotonic() - t0 >= max_wait:
         if not saw_traffic:
