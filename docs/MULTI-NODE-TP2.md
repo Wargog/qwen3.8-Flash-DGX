@@ -253,9 +253,15 @@ passed every gate, including bit-identical logprobs across a prefix hit — see 
    refuses, §1 row 2); `serve-tp2.sh` gates on BOTH nodes' index files proving
    the carveout (stale-rsync proof) and passes `VLLM_FP8_HYBRID=1` +
    `VLLM_USE_DEEP_GEMM=0` to both ranks. rsync the whole HF cache after
-   preparing. The load+serve at TP=2 is measured in #52 (MTP=2, v0.31); hybrid +
-   MTP=3 on this repo's stack has NOT yet run on a live pair — performance
-   numbers land here after the first run, gated per §3.7.
+   preparing. The load+serve at TP=2 is measured in #52 (MTP=2, v0.31).
+   **First live run gates GREEN, 2026-11-23** (fp8 KV, eager, native CTX,
+   MTP=3): smoke + tool calls pass; greedy fresh-vs-repeat byte-identical
+   (only tok/s fields differ); `tp2-needle` identity PASS at hit_frac 0.9975
+   — the intact-reload cell, <1 block uncached tail, SPLIT_PREFILL holding at
+   the checkpoint boundary; HumanEval ~98% and run-consistent (one sample
+   always hits the script's token cap = think-overflow truncation, a
+   false-fail of the harness, not a quality signal — #52's missing quality
+   eval is hereby covered). Performance numbers pending, same protocol as §4.
 3. **Draft-vocab under TP** (#52 §1 shard-aware `_dv_compute_logits` patch — it was
    offered as a PR and never merged; port it into `src/` as patch 10b).
 4. **fp8 KV (`KV_DTYPE=fp8_e4m3`)** — **LANDED**: now the `default-tp2.env`
