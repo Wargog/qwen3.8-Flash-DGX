@@ -225,7 +225,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
     --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" --distributed-executor-backend mp
     --max-model-len "$CTX" --max-num-seqs "$SEQS" --gpu-memory-utilization "$GPU_MEM"
     --enable-chunked-prefill --max-num-batched-tokens "$BATCH_TOKENS"
-    --kv-cache-dtype "$KV_DTYPE"
+    --kv-cache-dtype "$KV_DTYPE" --enable-prompt-tokens-details   # serve.sh parity; without it usage.prompt_tokens_details is null and probe/bench cached_tokens crash or vanish
     --no-enable-flashinfer-autotune --enable-auto-tool-choice
     --tool-call-parser qwen3_coder --reasoning-parser qwen3
     --speculative-config "{$SPEC}" "${EAGER_ARGS[@]}")
