@@ -192,6 +192,10 @@ EAGER_ARGS=(--enforce-eager); [ "${EAGER:-1}" = 1 ] || EAGER_ARGS=(-cc.cudagraph
 #  list applies.)
 SPEC="\"method\":\"mtp\",\"num_speculative_tokens\":${MTP:-4}"
 [ "${YARN:-0}" != 0 ] && SPEC="$SPEC,\"max_model_len\":${CTX}"
+# MTP=0 boots with no speculative decoding at all — the isolation knob for
+# cudagraph-vs-MTP-draft races (num_speculative_tokens=0 is a boot error, so
+# the flag has to be dropped entirely, not zeroed).
+SPEC_ARGS=(); [ "${MTP:-4}" != 0 ] && SPEC_ARGS=(--speculative-config "{$SPEC}")
 # same published YaRN recipe serve.sh uses (factor 4 over the native 262144)
 YARN_OVR='{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
 
@@ -228,7 +232,7 @@ launch() {  # $1 = rank, $2 = ssh target ('' = this node)
     --kv-cache-dtype "$KV_DTYPE" --enable-prompt-tokens-details   # serve.sh parity; without it usage.prompt_tokens_details is null and probe/bench cached_tokens crash or vanish
     --no-enable-flashinfer-autotune --enable-auto-tool-choice
     --tool-call-parser qwen3_coder --reasoning-parser qwen3
-    --speculative-config "{$SPEC}" "${EAGER_ARGS[@]}")
+    "${SPEC_ARGS[@]}" "${EAGER_ARGS[@]}")
   [ -n "${MAMBA_SSM_DTYPE:-}" ] && vllm_args+=(--mamba-ssm-cache-dtype "$MAMBA_SSM_DTYPE")
   [ "${YARN:-0}" != 0 ] && vllm_args+=(--hf-overrides "$YARN_OVR")
   [ ${#TPL_MNT[@]} -gt 0 ] && docker_args+=("${TPL_MNT[@]}")
